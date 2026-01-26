@@ -1,0 +1,227 @@
+version: "3.8"
+
+services:
+  # --- INFRASTRUCTURE: DATABASES ---
+  mongo:
+    image: mongo:6
+    container_name: auth_mongo
+    restart: unless-stopped
+    networks:
+      - auth-network
+    volumes:
+      - mongo-data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- INFRASTRUCTURE: HA REDIS CLUSTER ---
+  redis-master:
+    image: redis:7-alpine
+    container_name: auth_redis_master
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    networks:
+      - auth-network
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-replica:
+    image: redis:7-alpine
+    container_name: auth_redis_replica
+    restart: unless-stopped
+    command: redis-server --replicaof redis-master 6379
+    depends_on:
+      - redis-master
+    networks:
+      - auth-network
+
+  sentinel-1: &sentinel_base
+    image: bitnami/redis-sentinel:7.0
+    container_name: auth_sentinel_1
+    environment:
+      - REDIS_MASTER_NAME=my-ecom-master
+      - REDIS_MASTER_HOST=redis-master
+      - REDIS_MASTER_PORT_NUMBER=6379
+      - REDIS_SENTINEL_QUORUM=2
+    depends_on:
+      - redis-master
+    networks:
+      - auth-network
+
+  sentinel-2:
+    <<: *sentinel_base
+    container_name: auth_sentinel_2
+
+  sentinel-3:
+    <<: *sentinel_base
+    container_name: auth_sentinel_3
+
+  # --- INFRASTRUCTURE: KAFKA (REDPANDA) ---
+  kafka:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.2.1
+    container_name: auth_kafka
+    networks:
+      - auth-network
+    ports:
+      - "9092:9092"
+      - "19092:19092"
+    command:
+      - redpanda start
+      - --overprovisioned
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --node-id 0
+      - --check=false
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://kafka:9092,external://localhost:19092
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    container_name: auth_kafka_console
+    networks:
+      - auth-network
+    ports:
+      - "8081:8080"
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+    depends_on:
+      - kafka
+
+  # --- CORE API ---
+  api:
+    build: .
+    container_name: auth_api
+    env_file:
+      - .env
+    ports:
+      - "5000:5000"
+    # OPTIMIZATION: Removed bind mount. Image now relies on COPY in Dockerfile.
+    command: node server.js
+    networks:
+      - auth-network
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  # --- SPECIALIZED OMEGA WORKERS ---
+  worker-financial:
+    build: .
+    container_name: auth_worker_fin
+    env_file:
+      - .env
+    command: node financial_worker_runner.js
+    networks:
+      - auth-network
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+
+  worker-generic:
+    build: .
+    container_name: auth_worker_gen
+    env_file:
+      - .env
+    command: node generic_worker_runner.js
+    networks:
+      - auth-network
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  worker-address:
+    build: .
+    container_name: auth_worker_address
+    env_file:
+      - .env
+    command: node queues/addressWorker.js
+    networks:
+      - auth-network
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+
+  # --- HEALTH WATCHDOG (APPLICATION SENTINEL) ---
+  auth-sentinel-watchdog:
+    build: .
+    container_name: auth_sentinel_watchdog
+    command: node script/workerSentinel.js
+    env_file:
+      - .env
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    networks:
+      - auth-network
+    restart: always
+
+  # --- MONITORING STACK ---
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: auth_prometheus
+    user: root
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alert.rules.yml:/etc/prometheus/alert.rules.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - auth-network
+    depends_on:
+      - api
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: auth_alertmanager
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    ports:
+      - "9093:9093"
+    networks:
+      - auth-network
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: auth_grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - auth-network
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+networks:
+  auth-network:
+    driver: bridge
+
+volumes:
+  mongo-data:
+  redis-data:
+  grafana-data:

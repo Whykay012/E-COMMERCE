@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert.rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - "alertmanager:9093"
+
+scrape_configs:
+  # The Main API
+  - job_name: 'auth-api'
+    static_configs:
+      - targets: ['api:5000']
+
+  # The Specialized Workers (Add any worker that exposes a port)
+  - job_name: 'auth-workers'
+    static_configs:
+      - targets: 
+          - 'worker-financial:5001'
+          - 'worker-generic:5001'

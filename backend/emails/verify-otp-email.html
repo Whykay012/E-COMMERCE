@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Verify Your Account</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        background-color: #f7f7f7;
+        padding: 20px;
+      }
+      .container {
+        background: #fff;
+        padding: 30px;
+        border-radius: 10px;
+        max-width: 500px;
+        margin: auto;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+      .otp {
+        font-size: 24px;
+        font-weight: bold;
+        color: #2e6da4;
+      }
+      .footer {
+        font-size: 12px;
+        color: #999;
+        margin-top: 30px;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h2>{{COMPANY}}</h2>
+      <p>Hello {{EMAIL}},</p>
+      <p>
+        Thank you for signing up! Please verify your account using the OTP
+        below:
+      </p>
+      <p class="otp">{{OTP}}</p>
+      <p>This OTP is valid for 10 minutes.</p>
+      <p>If you didn't request this, please ignore this email.</p>
+      <div class="footer">
+        &copy; {{YEAR}} {{COMPANY}}. All rights reserved.
+      </div>
+    </div>
+  </body>
+</html>

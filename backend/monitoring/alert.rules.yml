@@ -1,0 +1,53 @@
+groups:
+- name: SecurityAlerts
+  rules:
+    # --- NEW: Replay Attack Detection ---
+    - alert: WebhookReplayAttack
+      expr: rate(webhook_replay_total[5m]) > 5
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "High volume of webhook replays detected"
+        description: "Provider {{ $labels.provider }} is sending excessive replays. Check for potential attack."
+
+    # --- NEW: Mass Banning Alert ---
+    - alert: MassSecurityBanning
+      expr: increase(webhook_replay_ban_total[15m]) > 20
+      for: 0m
+      labels:
+        severity: fatal
+      annotations:
+        summary: "System is mass-banning users"
+        description: "More than 20 IPs/Fingerprints banned in 15 minutes due to security violations."
+
+    # 1. Brute Force Alert
+    - alert: HighMfaFailureRate
+      expr: |
+        rate(risk_engine_action_total{action="failure"}[5m]) 
+        / 
+        rate(risk_engine_action_total{action="initiated"}[5m]) > 0.10
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Potential Brute Force detected on MFA"
+        description: "MFA failure rate is {{ $value | humanizePercentage }}."
+
+    # 2. Risk Engine Health
+    - alert: RiskEngineFailsafeActive
+      expr: increase(risk_engine_action_total{action="block", signals=~".*ENGINE_ERROR.*"}[1m]) > 0
+      for: 0m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Risk Engine is in Failsafe Mode"
+        description: "Internal errors detected in risk computation. System is failing-closed."
+    - alert: ServiceNotReady
+      expr: service_health_status{type="readiness"} == 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Service is failing Readiness checks"
+        description: "The HealthMonitor reports dependencies (DB/Redis/Queue) are unavailable."

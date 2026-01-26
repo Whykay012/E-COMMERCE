@@ -1,0 +1,3985 @@
+Attach PaymentService verification after online payment
+
+After the user completes payment (callback or webhook), you can call PaymentService.verifyPayment() to update wallet/order instantly.
+
+Idempotency for initializing online payments
+
+Before calling PaymentService.initializePayment(), check if a pending payment for the same order exists.
+
+This prevents duplicate payment records if the user refreshes the page.
+
+Integrate webhook-based wallet/order sync
+
+Currently CheckoutService only deducts wallet for immediate payment.
+
+For external payments, let PaymentService webhook handle wallet/order updates, keeping CheckoutService simpler.
+
+Event logging & provider metadata
+
+Store provider metadata and payment events on the order (optional).
+
+This helps for debugging and analytics.
+
+Support multiple payment providers
+
+Keep PaymentService flexible for Paystack, Stripe, or any future provider.
+
+CheckoutService only needs to call PaymentService.initializePayment() with provider info.
+
+Transaction safety
+
+You already use session for atomic cart → order → stock → wallet updates. Keep it.
+
+Optional: lightweight order response
+
+Populate only needed fields (items.product, totalAmount, status) when returning order in the API, which you already do..i will paste all my checkout related code implement the upgrade. // services/checkoutService.js
+const mongoose = require("mongoose");
+const Cart = require("../model/cart");
+const Order = require("../model/order");
+const Product = require("../model/product");
+const Payment = require("../model/payment");
+const User = require("../model/userModel");
+const PaymentService = require("./paymentService"); // uses your existing PaymentService
+const BadRequestError = require("../errors/bad-request-error");
+const NotFoundError = require("../errors/notFoundError");
+
+const DEFAULTS = {
+  TAX_RATE: 0.075, // 7.5% tax example - adjust to your business rules
+  SHIPPING_FLAT: 500, // flat shipping in NGN or your currency
+  CURRENCY: "NGN",
+};
+
+const CheckoutService = {
+  /**
+   * Calculate order totals (subtotal, tax, shipping, discounts, grandTotal).
+   * items: [{ productId, quantity, price, discount }]
+   */
+  calcTotals(items = []) {
+    const subtotal = items.reduce((sum, it) => {
+      const price = Number(it.price || 0);
+      const qty = Number(it.quantity || 1);
+      const discount = Number(it.discount || 0); // absolute discount amount
+      return sum + Math.max(0, price * qty - discount);
+    }, 0);
+
+    const tax = Math.round(subtotal * DEFAULTS.TAX_RATE);
+    const shipping = subtotal > 5000 ? 0 : DEFAULTS.SHIPPING_FLAT; // example free shipping threshold
+    const grandTotal = subtotal + tax + shipping;
+
+    return { subtotal, tax, shipping, grandTotal, currency: DEFAULTS.CURRENCY };
+  },
+
+  /**
+   * Validate cart integrity and product stock.
+   * Returns: { itemsDetailed } where each itemDetailed includes product snapshot.
+   */
+  async validateCartAndGetItems(userId) {
+    const cart = await Cart.findOne({ user: userId })
+      .populate("items.product")
+      .lean();
+    if (!cart || !Array.isArray(cart.items) || cart.items.length === 0) {
+      throw new BadRequestError("Your cart is empty");
+    }
+
+    const itemsDetailed = [];
+
+    for (const it of cart.items) {
+      const product = it.product;
+      if (!product) {
+        throw new NotFoundError(
+          `Product in cart not found (product id: ${it.product})`
+        );
+      }
+
+      const qty = Number(it.quantity || 1);
+      if (product.stock !== undefined && product.stock < qty) {
+        throw new BadRequestError(
+          `Insufficient stock for product "${product.name}"`
+        );
+      }
+
+      itemsDetailed.push({
+        productId: product._id,
+        name: product.name,
+        price: product.price,
+        quantity: qty,
+        discount: it.discount || 0,
+        selectedColor: it.selectedColor,
+        selectedSize: it.selectedSize,
+        image: product.images?.[0]?.url || "",
+      });
+    }
+
+    return { cart, itemsDetailed };
+  },
+
+  /**
+   * Create an order and (optionally) perform payment initialization.
+   *
+   * opts:
+   *  - userId
+   *  - paymentMethod: "online" | "wallet" | "cod"
+   *  - email: required for online init
+   *  - address: shipping address
+   *  - currency
+   *  - metadata
+   *
+   * Returns:
+   *  - order
+   *  - paymentInit (if paymentMethod === 'online') => { authorization_url, reference, access_code }
+   */
+  async createOrderAndMaybeInitPayment(opts = {}) {
+    const {
+      userId,
+      paymentMethod = "online",
+      email,
+      address,
+      currency = DEFAULTS.CURRENCY,
+      metadata = {},
+    } = opts;
+
+    if (!userId) throw new BadRequestError("Missing user");
+
+    // Validate cart and stock
+    const { cart, itemsDetailed } = await this.validateCartAndGetItems(userId);
+
+    // Build order totals
+    const { subtotal, tax, shipping, grandTotal } =
+      this.calcTotals(itemsDetailed);
+
+    // Start transaction if possible
+    const session = await mongoose.startSession().catch(() => null);
+    let useTransaction =
+      !!session && typeof session.startTransaction === "function";
+
+    if (useTransaction) session.startTransaction();
+
+    try {
+      // Snapshot products: we will decrease stock after order insertion
+      const orderPayload = {
+        user: userId,
+        items: itemsDetailed,
+        subtotal,
+        tax,
+        shipping,
+        totalAmount: grandTotal,
+        currency,
+        paymentStatus: paymentMethod === "wallet" ? "paid" : "pending",
+        orderStatus: paymentMethod === "wallet" ? "processing" : "pending",
+        address: address || cart.address || "N/A",
+        events: [
+          { label: "Order created", date: new Date() },
+          ...(paymentMethod === "wallet"
+            ? [{ label: "Paid with wallet", date: new Date() }]
+            : []),
+        ],
+        reference: null, // will set for online payments
+      };
+
+      // Insert order
+      const order = await Order.create([orderPayload], { session }).then(
+        (arr) => arr[0]
+      );
+
+      // Decrement product stock and increase sold count (if product has these fields)
+      for (const it of itemsDetailed) {
+        const update = {};
+        if (typeof it.quantity === "number") {
+          if (
+            "stock" in
+            (await Product.findById(it.productId).select("stock").lean())
+          ) {
+            update.$inc = { stock: -it.quantity };
+          }
+          // optionally track sold count
+          update.$inc = { ...(update.$inc || {}), sold: it.quantity };
+        }
+        if (Object.keys(update).length) {
+          // Perform atomic update
+          const res = await Product.findOneAndUpdate(
+            {
+              _id: it.productId,
+              ...(update.$inc && update.$inc.stock
+                ? { stock: { $gte: it.quantity } }
+                : {}),
+            },
+            update,
+            { session, new: true }
+          );
+          if (!res) {
+            throw new BadRequestError(
+              `Failed to reserve stock for product ${it.name}`
+            );
+          }
+        }
+      }
+
+      // Clear cart
+      await Cart.findOneAndUpdate(
+        { _id: cart._id },
+        { $set: { items: [] } },
+        { session }
+      );
+
+      // If paymentMethod is wallet: check balance and deduct immediately
+      if (paymentMethod === "wallet") {
+        const user = await User.findById(userId).session(session || null);
+        if (!user) throw new NotFoundError("User not found");
+
+        if ((user.walletBalance || 0) < grandTotal) {
+          throw new BadRequestError("Insufficient wallet balance");
+        }
+
+        user.walletBalance = (user.walletBalance || 0) - grandTotal;
+        await user.save({ session });
+
+        // Create payment record
+        const payment = await Payment.create(
+          [
+            {
+              user: userId,
+              amount: grandTotal,
+              currency,
+              status: "success",
+              provider: "wallet",
+              reference: `wallet-${order._id}-${Date.now()}`,
+              metadata,
+            },
+          ],
+          { session }
+        ).then((arr) => arr[0]);
+
+        // Link payment and order
+        order.paymentStatus = "paid";
+        order.reference = payment.reference;
+        order.payment = payment._id;
+        order.events.push({
+          label: "Wallet payment applied",
+          date: new Date(),
+        });
+        await order.save({ session });
+      }
+
+      // If online payment: initialize via PaymentService (Paystack/Stripe)
+      let paymentInit = null;
+      if (paymentMethod === "online") {
+        // initializePayment will create a Payment record (pending) and return reference + authorization_url
+        const initResult = await PaymentService.initializePayment(
+          userId,
+          grandTotal,
+          email || (await User.findById(userId).select("email").lean()).email,
+          currency,
+          { orderId: order._id, ...metadata }
+        );.// services/paymentService.js
+const axios = require("axios");
+const Payment = require("../model/payment");
+const User = require("../model/userModel");
+const Order = require("../model/order");
+
+const WebhookLog = require("../model/webhookLog");
+const BadRequestError = require("../errors/bad-request-error");
+const NotFoundError = require("../errors/notFoundError");
+const generateReference = require("../utils/generateReference");
+
+const PAYSTACK_BASE =
+  process.env.PAYSTACK_BASE_URL || "https://api.paystack.co";
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+const STRIPE_SECRET = process.env.STRIPE_SECRET;
+
+if (!PAYSTACK_SECRET) {
+  console.warn(
+    "❗ PAYSTACK_SECRET_KEY not set — payment init/verify will fail."
+  );
+}
+if (!STRIPE_SECRET) {
+  console.warn("ℹ️ Stripe secret not set — Stripe webhook/verify disabled.");
+}
+
+const headers = (provider = "paystack") => {
+  if (provider === "paystack") {
+    return {
+      Authorization: `Bearer ${PAYSTACK_SECRET}`,
+      "Content-Type": "application/json",
+    };
+  }
+  return { "Content-Type": "application/json" };
+};
+
+const PaymentService = {
+  // ----------------------------
+  // getWallet: returns balance + recent payments
+  // ----------------------------
+  getWallet: async (userId) => {
+    const user = await User.findById(userId).lean();
+    if (!user) throw new NotFoundError("User not found");
+
+    const recentPayments = await Payment.find({ user: userId })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .lean();
+
+    return {
+      balance: user.walletBalance || 0,
+      recentPayments,
+    };
+  },
+
+  // ----------------------------
+  // checkPendingPayment (idempotency)
+  // ----------------------------
+  checkPendingPayment: async (userId, amount) => {
+    return Payment.findOne({ user: userId, amount, status: "pending" });
+  },
+
+  // ----------------------------
+  // initializePayment
+  // Creates a local Payment doc then calls provider (Paystack)
+  // Returns { reference, authorization_url, access_code }
+  // ----------------------------
+  initializePayment: async (
+    userId,
+    amount,
+    email,
+    currency = "NGN",
+    metadata = {}
+  ) => {
+    if (!amount || amount <= 0) throw new BadRequestError("Invalid amount");
+    if (!email) throw new BadRequestError("Email is required");
+
+    // Idempotency: if pending exists, return it
+    const existing = await PaymentService.checkPendingPayment(userId, amount);
+    if (existing) {
+      return {
+        reference: existing.reference,
+        authorization_url: existing.metadata?.authorization_url || null,
+        access_code: existing.metadata?.access_code || null,
+        message: "Pending payment already exists",
+      };
+    }
+
+    // Generate unique reference and create local pending payment
+    const reference = generateReference("pay");
+    const payment = await Payment.create({
+      user: userId,
+      reference,
+      amount,
+      currency,
+      status: "pending",
+      provider: "paystack",
+      metadata: { initiatingEmail: email, ...metadata },
+    });
+
+    // Prepare provider payload. Paystack expects KOBO for NGN
+    const payload = {
+      email,
+      amount: currency === "NGN" ? Math.round(amount * 100) : amount,
+      currency,
+      reference,
+      metadata: { paymentId: payment._id.toString(), ...metadata },
+    };
+
+    // Call Paystack initialize
+    const resp = await axios.post(
+      `${PAYSTACK_BASE}/transaction/initialize`,
+      payload,
+      { headers: headers("paystack") }
+    );
+    const data = resp.data?.data;
+    if (!data || !data.reference) {
+      // Keep local pending but report error
+      throw new BadRequestError("Failed to initialize payment with provider");
+    }
+
+    // persist provider metadata
+    payment.metadata = { ...payment.metadata, providerInit: data };
+    await payment.save();
+
+    return {
+      reference: data.reference,
+      authorization_url: data.authorization_url,
+      access_code: data.access_code,
+      message: "Payment initialized",
+    };
+  },
+
+  // ----------------------------
+  // verifyPayment(reference)
+  // - verifies with provider
+  // - updates local Payment record
+  // - updates wallet balance & linked order if success
+  // - returns { success, status, updatedWallet, payment, providerData }
+  // ----------------------------
+  verifyPayment: async (reference) => {
+    if (!reference) throw new BadRequestError("Payment reference is required");
+
+    // Find local payment (if exists). Still proceed to provider verify.
+    const payment = await Payment.findOne({ reference });
+    if (!payment) {
+      // No local record: still try to verify provider and upsert payment later
+      // But since we expect local payments to be created during initialize, treat as not found.
+      throw new NotFoundError("Payment not found");
+    }
+
+    // Call provider (Paystack)
+    const resp = await axios.get(
+      `${PAYSTACK_BASE}/transaction/verify/${reference}`,
+      { headers: headers("paystack") }
+    );
+    const data = resp.data?.data;
+    if (!data)
+      throw new BadRequestError("Invalid verification response from provider");
+
+    const isSuccess = data.status === "success";
+
+    // Update local payment record
+    payment.status = isSuccess ? "success" : "failed";
+    payment.channel = data.channel || payment.channel;
+    payment.provider = "paystack";
+    payment.metadata = { ...payment.metadata, providerVerify: data };
+    await payment.save();
+
+    let updatedWallet = null;
+
+    if (isSuccess) {
+      const user = await User.findById(payment.user);
+      if (!user) throw new NotFoundError("User not found");
+
+      user.walletBalance = (user.walletBalance || 0) + payment.amount;
+      await user.save();
+      updatedWallet = { balance: user.walletBalance };
+
+      // If there is an order tied to this reference, mark as paid/processing
+      const order = await Order.findOne({ reference });
+      if (order) {
+        order.paymentStatus = "paid";
+        if (!order.orderStatus || order.orderStatus === "pending") {
+          order.orderStatus = "processing";
+        }
+        order.events = order.events || [];
+        order.events.push({
+          label: `Payment verified (provider: paystack) — ${data.status}`,
+          date: new Date(),
+        });
+        await order.save();
+      }
+    }
+
+    return {
+      success: isSuccess,
+      status: data.status,
+      updatedWallet,
+      payment: payment.toObject(),
+      providerData: data,
+      message: isSuccess
+        ? "Payment verified successfully"
+        : "Payment verification failed",
+    };
+  },
+
+  // ----------------------------
+  // Enhanced getPaymentHistory (server-side filters & pagination)
+  // returns { payments, count, page, totalPages }
+  // ----------------------------
+  getPaymentHistory: async (
+    userId,
+    { page = 1, limit = 10, status, search } = {}
+  ) => {
+    const query = { user: userId };
+    if (status && status !== "all") query.status = status;
+    if (search) {
+      query.$or = [
+        { reference: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const total = await Payment.countDocuments(query);
+    const payments = await Payment.find(query)
+      .sort({ createdAt: -1 })
+      .skip((Math.max(1, page) - 1) * limit)
+      .limit(Number(limit || 10))
+      .lean();
+
+    return {
+      payments,
+      count: total,
+      page: Number(page || 1),
+      totalPages: Math.max(1, Math.ceil(total / (limit || 10))),
+    };
+  },
+
+  // ----------------------------
+  // processProviderWebhook(payload, provider)
+  // - Unified webhook handler to be used by webhook route
+  // - Ensures idempotency, updates payment/order/wallet, logs webhook
+  // ----------------------------
+  processProviderWebhook: async ({
+    provider,
+    payload,
+    rawBody,
+    headers = {},
+    app,
+  }) => {
+    // provider: 'paystack' | 'stripe'
+    // payload: provider's parsed object (dependent on provider)
+    // rawBody: raw request body needed for signature verification if required
+    // app: express app to access io
+
+    // Basic structure: extract reference or metadata.paymentId or orderId
+    let reference, status, amount, userId, orderId, providerData;
+
+    if (provider === "paystack") {
+      // Paystack sends data object inside 'event' or direct body shape
+      // payload may be the whole webhook object or direct transaction object
+      const eventData = payload?.data || payload;
+      reference = eventData?.reference || eventData?.id;
+      status = eventData?.status || null;
+      amount = eventData?.amount ? eventData.amount / 100 : null; // paystack KOBO -> NGN
+      providerData = eventData;
+      orderId = eventData?.metadata?.orderId || null;
+      userId = eventData?.metadata?.userId || eventData?.customer?.id || null;
+    } else if (provider === "stripe") {
+      // Stripe sends nested event.data.object
+      const eventData = payload?.data?.object || payload;
+      reference = eventData?.metadata?.reference || eventData?.id;
+      status = eventData?.status || eventData?.payment_status || null;
+      amount = eventData?.amount ? eventData.amount / 100 : null;
+      providerData = eventData;
+      orderId = eventData?.metadata?.orderId || null;
+      userId = eventData?.metadata?.userId || null;
+    } else {
+      throw new Error("Unsupported provider in processProviderWebhook");
+    }
+
+    // Write a webhook log entry (initial)
+    const logEntry = await WebhookLog.create({
+      provider,
+      reference: reference || null,
+      payload: payload,
+      status: "processing",
+    });
+
+    try {
+      // If we have a reference, try to find a local payment
+      let payment = null;
+      if (reference) {
+        payment = await Payment.findOne({ reference });
+      }
+
+      // If no local payment exists, optionally create one in failed/pending state (safe-guard)
+      if (!payment) {
+        payment = await Payment.create({
+          user: userId || null,
+          reference: reference || generateReference("web"),
+          amount: amount || 0,
+          currency: "NGN",
+          status: status === "success" ? "success" : "pending",
+          provider,
+          metadata: { providerData },
+        });
+      } else {
+        // If payment already processed as success, skip re-processing (idempotency)
+        if (payment.status === "success" && status === "success") {
+          await logEntry.updateOne({
+            status: "skipped",
+            note: "Already processed",
+          });
+          return { processed: false, reason: "already_processed", payment };
+        }
+
+        // Update payment status
+        payment.status = status === "success" ? "success" : payment.status;
+        payment.metadata = {
+          ...payment.metadata,
+          providerWebhook: providerData,
+        };
+        payment.provider = provider;
+        await payment.save();
+      }
+
+      // If succeeded → update wallet & order
+      if (status === "success") {
+        if (payment.user) {
+          const user = await User.findById(payment.user);
+          if (user) {
+            user.walletBalance = (user.walletBalance || 0) + payment.amount;
+            await user.save();
+            // Emit socket
+            const io = app.get("io");
+            if (io) {
+              try {
+                io.to(user._id.toString()).emit("walletUpdated", {
+                  wallet: { balance: user.walletBalance },
+                  payment,
+                });
+              } catch (emitErr) {
+                console.warn("emit walletUpdated failed:", emitErr.message);
+              }
+            }
+          }
+        }
+
+        if (orderId) {
+          const order = await Order.findById(orderId);
+          if (order) {
+            order.paymentStatus = "paid";
+            order.orderStatus = order.orderStatus || "processing";
+            order.events = order.events || [];
+            order.events.push({
+              label: `Payment success via webhook (${provider})`,
+              date: new Date(),
+            });
+            await order.save();
+
+            const io = app.get("io");
+            if (io)
+              io.to(order.userId?.toString?.() || order.user?.toString()).emit(
+                "orderUpdated",
+                { orderId: order._id.toString(), status: order.orderStatus }
+              );
+          }
+        }
+      }
+
+      await logEntry.updateOne({ status: "processed" });
+      return { processed: true, payment };
+    } catch (err) {
+      console.error("processProviderWebhook error:", err);
+      await logEntry.updateOne({ status: "failed", error: err.message });
+      throw err;
+    }
+  },
+};
+
+module.exports = PaymentService;
+ 
+
+        // attach reference to order for linkage
+        order.reference = initResult.reference;
+        order.paymentStatus = "pending";
+        await order.save({ session });
+
+        paymentInit = initResult;
+      }
+
+      // Commit transaction if used
+      if (useTransaction) {
+        await session.commitTransaction();
+      }
+
+      // Populate lightweight order for response
+      const populatedOrder = await Order.findById(order._id)
+        .populate("items.product", "name images price")
+        .lean();
+
+      // After commit, emit order created to user's socket room (non-blocking)
+      try {
+        const io =
+          (global?.appInstance && global.appInstance.get?.("io")) || null;
+        // prefer req.app.get('io') inside controller; here we'll emit in controller
+        if (io && order.user) {
+          io.to(order.user.toString()).emit("orderCreated", {
+            orderId: order._id,
+          });
+        }
+      } catch (emitErr) {
+        // silently continue; do not break checkout
+        console.warn(
+          "Socket emit orderCreated failed:",
+          emitErr.message || emitErr
+        );
+      }
+
+      return { order: populatedOrder, paymentInit };
+    } catch (err) {
+      // rollback transaction if used
+      if (useTransaction && session) {
+        try {
+          await session.abortTransaction();
+        } catch (aErr) {
+          console.error("Failed to abort transaction:", aErr);
+        }
+      }
+      throw err;
+    } finally {
+      if (session) session.endSession();
+    }
+  },
+};
+
+module.exports = CheckoutService; ,// utils/generateReference.js
+const { v4: uuidv4 } = require("uuid");
+
+const generateReference = (prefix = "pay") => {
+  return `${prefix}_${Date.now()}_${uuidv4().split("-")[0]}`;
+};
+
+module.exports = generateReference; .// services/checkoutService.js
+const mongoose = require("mongoose");
+const Cart = require("../model/cart");
+const Order = require("../model/order");
+const Product = require("../model/product");
+const Payment = require("../model/payment");
+const User = require("../model/userModel");
+const PaymentService = require("./paymentService"); // uses your existing PaymentService
+const BadRequestError = require("../errors/bad-request-error");
+const NotFoundError = require("../errors/notFoundError");
+
+const DEFAULTS = {
+  TAX_RATE: 0.075, // 7.5% tax example - adjust to your business rules
+  SHIPPING_FLAT: 500, // flat shipping in NGN or your currency
+  CURRENCY: "NGN",
+};
+
+const CheckoutService = {
+  /**
+   * Calculate order totals (subtotal, tax, shipping, discounts, grandTotal).
+   * items: [{ productId, quantity, price, discount }]
+   */
+  calcTotals(items = []) {
+    const subtotal = items.reduce((sum, it) => {
+      const price = Number(it.price || 0);
+      const qty = Number(it.quantity || 1);
+      const discount = Number(it.discount || 0); // absolute discount amount
+      return sum + Math.max(0, price * qty - discount);
+    }, 0);
+
+    const tax = Math.round(subtotal * DEFAULTS.TAX_RATE);
+    const shipping = subtotal > 5000 ? 0 : DEFAULTS.SHIPPING_FLAT; // example free shipping threshold
+    const grandTotal = subtotal + tax + shipping;
+
+    return { subtotal, tax, shipping, grandTotal, currency: DEFAULTS.CURRENCY };
+  },
+
+  /**
+   * Validate cart integrity and product stock.
+   * Returns: { itemsDetailed } where each itemDetailed includes product snapshot.
+   */
+  async validateCartAndGetItems(userId) {
+    const cart = await Cart.findOne({ user: userId })
+      .populate("items.product")
+      .lean();
+    if (!cart || !Array.isArray(cart.items) || cart.items.length === 0) {
+      throw new BadRequestError("Your cart is empty");
+    }
+
+    const itemsDetailed = [];
+
+    for (const it of cart.items) {
+      const product = it.product;
+      if (!product) {
+        throw new NotFoundError(
+          `Product in cart not found (product id: ${it.product})`
+        );
+      }
+
+      const qty = Number(it.quantity || 1);
+      if (product.stock !== undefined && product.stock < qty) {
+        throw new BadRequestError(
+          `Insufficient stock for product "${product.name}"`
+        );
+      }
+
+      itemsDetailed.push({
+        productId: product._id,
+        name: product.name,
+        price: product.price,
+        quantity: qty,
+        discount: it.discount || 0,
+        selectedColor: it.selectedColor,
+        selectedSize: it.selectedSize,
+        image: product.images?.[0]?.url || "",
+      });
+    }
+
+    return { cart, itemsDetailed };
+  },
+
+  /**
+   * Create an order and (optionally) perform payment initialization.
+   *
+   * opts:
+   *  - userId
+   *  - paymentMethod: "online" | "wallet" | "cod"
+   *  - email: required for online init
+   *  - address: shipping address
+   *  - currency
+   *  - metadata
+   *
+   * Returns:
+   *  - order
+   *  - paymentInit (if paymentMethod === 'online') => { authorization_url, reference, access_code }
+   */
+  async createOrderAndMaybeInitPayment(opts = {}) {
+    const {
+      userId,
+      paymentMethod = "online",
+      email,
+      address,
+      currency = DEFAULTS.CURRENCY,
+      metadata = {},
+    } = opts;
+
+    if (!userId) throw new BadRequestError("Missing user");
+
+    // Validate cart and stock
+    const { cart, itemsDetailed } = await this.validateCartAndGetItems(userId);
+
+    // Build order totals
+    const { subtotal, tax, shipping, grandTotal } =
+      this.calcTotals(itemsDetailed);
+
+    // Start transaction if possible
+    const session = await mongoose.startSession().catch(() => null);
+    let useTransaction =
+      !!session && typeof session.startTransaction === "function";
+
+    if (useTransaction) session.startTransaction();
+
+    try {
+      // Snapshot products: we will decrease stock after order insertion
+      const orderPayload = {
+        user: userId,
+        items: itemsDetailed,
+        subtotal,
+        tax,
+        shipping,
+        totalAmount: grandTotal,
+        currency,
+        paymentStatus: paymentMethod === "wallet" ? "paid" : "pending",
+        orderStatus: paymentMethod === "wallet" ? "processing" : "pending",
+        address: address || cart.address || "N/A",
+        events: [
+          { label: "Order created", date: new Date() },
+          ...(paymentMethod === "wallet"
+            ? [{ label: "Paid with wallet", date: new Date() }]
+            : []),
+        ],
+        reference: null, // will set for online payments
+      };
+
+      // Insert order
+      const order = await Order.create([orderPayload], { session }).then(
+        (arr) => arr[0]
+      );
+
+      // Decrement product stock and increase sold count (if product has these fields)
+      for (const it of itemsDetailed) {
+        const update = {};
+        if (typeof it.quantity === "number") {
+          if (
+            "stock" in
+            (await Product.findById(it.productId).select("stock").lean())
+          ) {
+            update.$inc = { stock: -it.quantity };
+          }
+          // optionally track sold count
+          update.$inc = { ...(update.$inc || {}), sold: it.quantity };
+        }
+        if (Object.keys(update).length) {
+          // Perform atomic update
+          const res = await Product.findOneAndUpdate(
+            {
+              _id: it.productId,
+              ...(update.$inc && update.$inc.stock
+                ? { stock: { $gte: it.quantity } }
+                : {}),
+            },
+            update,
+            { session, new: true }
+          );
+          if (!res) {
+            throw new BadRequestError(
+              `Failed to reserve stock for product ${it.name}`
+            );
+          }
+        }
+      }
+
+      // Clear cart
+      await Cart.findOneAndUpdate(
+        { _id: cart._id },
+        { $set: { items: [] } },
+        { session }
+      );
+
+      // If paymentMethod is wallet: check balance and deduct immediately
+      if (paymentMethod === "wallet") {
+        const user = await User.findById(userId).session(session || null);
+        if (!user) throw new NotFoundError("User not found");
+
+        if ((user.walletBalance || 0) < grandTotal) {
+          throw new BadRequestError("Insufficient wallet balance");
+        }
+
+        user.walletBalance = (user.walletBalance || 0) - grandTotal;
+        await user.save({ session });
+
+        // Create payment record
+        const payment = await Payment.create(
+          [
+            {
+              user: userId,
+              amount: grandTotal,
+              currency,
+              status: "success",
+              provider: "wallet",
+              reference: `wallet-${order._id}-${Date.now()}`,
+              metadata,
+            },
+          ],
+          { session }
+        ).then((arr) => arr[0]);
+
+        // Link payment and order
+        order.paymentStatus = "paid";
+        order.reference = payment.reference;
+        order.payment = payment._id;
+        order.events.push({
+          label: "Wallet payment applied",
+          date: new Date(),
+        });
+        await order.save({ session });
+      }
+
+      // If online payment: initialize via PaymentService (Paystack/Stripe)
+      let paymentInit = null;
+      if (paymentMethod === "online") {
+        // initializePayment will create a Payment record (pending) and return reference + authorization_url
+        const initResult = await PaymentService.initializePayment(
+          userId,
+          grandTotal,
+          email || (await User.findById(userId).select("email").lean()).email,
+          currency,
+          { orderId: order._id, ...metadata }
+        );
+
+        // attach reference to order for linkage
+        order.reference = initResult.reference;
+        order.paymentStatus = "pending";
+        await order.save({ session });
+
+        paymentInit = initResult;
+      }
+
+      // Commit transaction if used
+      if (useTransaction) {
+        await session.commitTransaction();
+      }
+
+      // Populate lightweight order for response
+      const populatedOrder = await Order.findById(order._id)
+        .populate("items.product", "name images price")
+        .lean();
+
+      // After commit, emit order created to user's socket room (non-blocking)
+      try {
+        const io =
+          (global?.appInstance && global.appInstance.get?.("io")) || null;
+        // prefer req.app.get('io') inside controller; here we'll emit in controller
+        if (io && order.user) {
+          io.to(order.user.toString()).emit("orderCreated", {
+            orderId: order._id,
+          });
+        }
+      } catch (emitErr) {
+        // silently continue; do not break checkout
+        console.warn(
+          "Socket emit orderCreated failed:",
+          emitErr.message || emitErr
+        );
+      }
+
+      return { order: populatedOrder, paymentInit };
+    } catch (err) {
+      // rollback transaction if used
+      if (useTransaction && session) {
+        try {
+          await session.abortTransaction();
+        } catch (aErr) {
+          console.error("Failed to abort transaction:", aErr);
+        }
+      }
+      throw err;
+    } finally {
+      if (session) session.endSession();
+    }
+  },
+};
+
+module.exports = CheckoutService;
+// routes/paymentWebhook.js
+const express = require("express");
+const router = express.Router();
+const PaymentService = require("../services/paymentService");
+const WebhookLog = require("../model/webHookLog");
+const Stripe = require("stripe");
+const crypto = require("crypto");
+
+const stripe = process.env.STRIPE_SECRET
+  ? new Stripe(process.env.STRIPE_SECRET)
+  : null;
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET; // optional, not always used
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // used for stripe signature verification
+
+// For raw body access in Express: ensure in main server you use:
+// app.use('/api/webhooks/payment', express.raw({ type: '*/*' }), paymentWebhookRouter);
+// Otherwise paystack verification with raw body may fail.
+
+// -----------------------------
+// Paystack signature verification helper
+// Paystack uses 'x-paystack-signature' header (HMAC sha512 of raw body using PAYSTACK_SECRET)
+// -----------------------------
+function verifyPaystackSignature(rawBody, headers) {
+  const sig = headers["x-paystack-signature"];
+  if (!PAYSTACK_SECRET || !sig) return false;
+  const hash = crypto
+    .createHmac("sha512", PAYSTACK_SECRET)
+    .update(rawBody)
+    .digest("hex");
+  return hash === sig;
+}
+
+// -----------------------------
+// Stripe verification helper
+// -----------------------------
+function verifyStripeSignature(rawBody, sigHeader) {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return null;
+  try {
+    const event = stripe.webhooks.constructEvent(
+      rawBody,
+      sigHeader,
+      STRIPE_WEBHOOK_SECRET
+    );
+    return event;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// -----------------------------
+// Unified webhook route: POST /api/webhooks/payment
+// Accepts Paystack + Stripe
+// -----------------------------
+router.post("/payment", async (req, res) => {
+  // IMPORTANT: main server should mount this route with express.raw() middleware
+  // e.g. app.use('/api/webhooks/payment', express.raw({ type: '*/*' }), paymentWebhookRouter);
+
+  const rawBody = req.body; // when using express.raw this is Buffer
+  const headers = req.headers || {};
+  const io = req.app.get("io");
+
+  // Determine provider by headers
+  const isStripe = !!headers["stripe-signature"];
+  const isPaystack =
+    !!headers["x-paystack-signature"] ||
+    headers["user-agent"]?.includes?.("Paystack");
+
+  try {
+    if (isStripe) {
+      // Verify stripe signature and parse event
+      const sigHeader = headers["stripe-signature"];
+      const event = verifyStripeSignature(rawBody, sigHeader);
+      if (!event) return res.status(400).send("Invalid stripe signature");
+
+      // Use service to process
+      await PaymentService.processProviderWebhook({
+        provider: "stripe",
+        payload: event,
+        rawBody,
+        headers,
+        app: req.app,
+      });
+
+      return res.status(200).json({ received: true });
+    }
+
+    if (isPaystack) {
+      // rawBody is a Buffer from express.raw; convert to string for HMAC
+      const bodyString = rawBody.toString();
+      const ok = verifyPaystackSignature(bodyString, headers);
+
+      if (!ok) {
+        console.warn("Paystack signature invalid");
+        return res.status(400).json({ msg: "Invalid Paystack signature" });
+      }
+
+      // Parse JSON
+      let parsed;
+      try {
+        parsed = JSON.parse(bodyString);
+      } catch (err) {
+        console.error("Failed to parse paystack body:", err);
+        return res.status(400).json({ msg: "Invalid JSON" });
+      }
+
+      await PaymentService.processProviderWebhook({
+        provider: "paystack",
+        payload: parsed,
+        rawBody: bodyString,
+        headers,
+        app: req.app,
+      });
+
+      return res.status(200).json({ received: true });
+    }
+
+    // Unknown provider - attempt to parse JSON and process generically
+    let maybe = req.body;
+    if (typeof maybe === "string") {
+      try {
+        maybe = JSON.parse(maybe);
+      } catch (_) {}
+    }
+
+    // Try to detect reference or provider
+    await PaymentService.processProviderWebhook({
+      provider: "unknown",
+      payload: maybe,
+      rawBody,
+      headers,
+      app: req.app,
+    });
+
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    console.error("Webhook processing failed:", err.message || err);
+    // Log failure
+    await WebhookLog.create({
+      provider: isStripe ? "stripe" : isPaystack ? "paystack" : "unknown",
+      payload: req.body,
+      status: "failed",
+      error: err.message,
+    }).catch(() => {});
+
+    return res.status(500).json({ msg: "Webhook processing error" });
+  }
+});
+
+module.exports = router;.import express from "express";
+import Order from "../models/orderModel.js";
+import WebhookLog from "../models/webhookLog.js";
+import { StatusCodes } from "http-status-codes";
+import getOrderStatusProgress from "../utils/orderStatusProgress.js";
+import Stripe from "stripe";
+import crypto from "crypto";
+
+const router = express.Router();
+const stripe = new Stripe(process.env.STRIPE_SECRET);
+
+// Stripe signature verification
+function verifyStripeSignature(req, res, next) {
+  const sig = req.headers["stripe-signature"];
+  try {
+    const event = stripe.webhooks.constructEvent(
+      req.rawBody,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+    req.provider = "Stripe";
+    req.webhookPayload = event.data.object;
+    next();
+  } catch (err) {
+    console.error("Stripe webhook signature invalid:", err.message);
+    return res.status(400).json({ msg: "Invalid Stripe webhook signature" });
+  }
+}
+
+// Paystack signature verification
+function verifyPaystackSignature(req, res, next) {
+  const paystackSig = req.headers["x-paystack-signature"];
+  const secret = process.env.PAYSTACK_SECRET;
+  const hash = crypto
+    .createHmac("sha512", secret)
+    .update(req.rawBody)
+    .digest("hex");
+
+  if (hash !== paystackSig) {
+    console.error("Paystack webhook signature invalid");
+    return res.status(400).json({ msg: "Invalid Paystack webhook signature" });
+  }
+
+  req.provider = "Paystack";
+  req.webhookPayload = req.body;
+  next();
+}
+
+// Unified route
+router.post(
+  "/order-update",
+  async (req, res, next) => {
+    const provider = req.headers["stripe-signature"]
+      ? "stripe"
+      : req.headers["x-paystack-signature"]
+      ? "paystack"
+      : null;
+
+    if (provider === "stripe") return verifyStripeSignature(req, res, next);
+    if (provider === "paystack") return verifyPaystackSignature(req, res, next);
+
+    return res
+      .status(StatusCodes.BAD_REQUEST)
+      .json({ msg: "Unknown webhook provider" });
+  },
+  async (req, res) => {
+    const { orderId, status, eventTime } = req.webhookPayload;
+    let logEntry;
+
+    try {
+      const order = await Order.findById(orderId);
+      if (!order) {
+        logEntry = await WebhookLog.create({
+          provider: req.provider,
+          orderId,
+          payload: req.webhookPayload,
+          status: "failed",
+          error: "Order not found",
+        });
+        return res
+          .status(StatusCodes.NOT_FOUND)
+          .json({ msg: "Order not found" });
+      }
+
+      order.status = status;
+      order.statusProgress = getOrderStatusProgress(status);
+      order.events.push({
+        label: `Status updated via webhook (${req.provider}): ${status}`,
+        date: eventTime || new Date(),
+      });
+      await order.save();
+
+      // Emit to user's room
+      const io = req.app.get("io");
+      io.to(order.userId.toString()).emit("orderUpdated", { orderId, status });
+
+      // Log success
+      logEntry = await WebhookLog.create({
+        provider: req.provider,
+        orderId,
+        payload: req.webhookPayload,
+        status: "processed",
+      });
+
+      console.log(
+        `Webhook updated order ${orderId} via ${req.provider} to status ${status}`
+      );
+      res.status(StatusCodes.OK).json({ msg: "Order status updated", order });
+    } catch (error) {
+      console.error("Webhook processing error:", error);
+      if (!logEntry) {
+        await WebhookLog.create({
+          provider: req.provider,
+          orderId: req.webhookPayload?.orderId,
+          payload: req.webhookPayload,
+          status: "failed",
+          error: error.message,
+        });
+      }
+      res
+        .status(StatusCodes.INTERNAL_SERVER_ERROR)
+        .json({ msg: "Server error" });
+    }
+  }
+);
+
+export default router;.// controllers/checkoutController.js
+const CheckoutService = require("../services/checkoutService");
+const { StatusCodes } = require("http-status-codes");
+const BadRequestError = require("../errors/bad-request-error");
+
+exports.createCheckout = async (req, res, next) => {
+  try {
+    const userId = req.user?._id || (req.user && req.user.userID);
+    if (!userId)
+      return res
+        .status(StatusCodes.UNAUTHORIZED)
+        .json({ message: "Not authenticated" });
+
+    // Accept: paymentMethod ("online" | "wallet" | "cod"), email, address, currency, metadata
+    const {
+      paymentMethod = "online",
+      email,
+      address,
+      currency,
+      metadata = {},
+    } = req.body;
+
+    if (!["online", "wallet", "cod"].includes(paymentMethod)) {
+      throw new BadRequestError("Invalid payment method");
+    }
+
+    // Create order and maybe initialize payment
+    const result = await CheckoutService.createOrderAndMaybeInitPayment({
+      userId,
+      paymentMethod,
+      email,
+      address,
+      currency,
+      metadata,
+    });
+
+    // If paymentInit exists, return authorization url + order
+    res.status(StatusCodes.CREATED).json({
+      success: true,
+      message: "Order created",
+      order: result.order,
+      payment: result.paymentInit || null,
+    });
+  } catch (err) {
+    next(err);
+  }
+};.// controllers/paymentController.js
+const PaymentService = require("../services/paymentService");
+const BadRequestError = require("../errors/bad-request-error");
+
+/**
+ * GET /api/payment/wallet
+ */
+exports.getWallet = async (req, res, next) => {
+  try {
+    const wallet = await PaymentService.getWallet(req.user._id);
+    return res.status(200).json(wallet);
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/payment/initiate
+ * Body: { amount, email?, currency?, metadata? }
+ */
+exports.initializePayment = async (req, res, next) => {
+  try {
+    const { amount, email, currency, metadata } = req.body;
+    if (!amount) throw new BadRequestError("Amount is required");
+
+    const result = await PaymentService.initializePayment(
+      req.user._id,
+      Number(amount),
+      email || req.user?.email,
+      currency || "NGN",
+      metadata || {}
+    );
+
+    return res.status(200).json(result);
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET or POST /api/payment/verify?reference=xxx
+ * Accepts GET (frontend redirect) or POST from provider webhooks if needed
+ */
+exports.verifyPayment = async (req, res, next) => {
+  try {
+    const reference = req.query.reference || req.body.reference;
+    if (!reference) throw new BadRequestError("Reference is required");
+
+    const result = await PaymentService.verifyPayment(reference);
+
+    // Emit socket event if wallet was updated (use payment.user if server-called)
+    if (result.updatedWallet) {
+      const io = req.app.get("io");
+      const userId = result.payment?.user || (req.user && req.user._id);
+      if (io && userId) {
+        try {
+          io.to(userId.toString()).emit("walletUpdated", {
+            wallet: result.updatedWallet,
+            payment: result.payment,
+          });
+        } catch (emitErr) {
+          console.warn("Socket emit failed (walletUpdated):", emitErr.message);
+        }
+      }
+    }
+
+    return res.status(200).json({
+      status: result.status,
+      success: result.success,
+      updatedWallet: result.updatedWallet,
+      message: result.message,
+      providerData: result.providerData || null,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/payment/history?page=&limit=&status=&search=
+ */
+exports.getPaymentHistory = async (req, res, next) => {
+  try {
+    const { page = 1, limit = 10, status, search } = req.query;
+    const history = await PaymentService.getPaymentHistory(req.user._id, {
+      page: Number(page),
+      limit: Number(limit),
+      status,
+      search,
+    });
+
+    return res.status(200).json(history);
+  } catch (err) {
+    next(err);
+  }
+};const { StatusCodes } = require("http-status-codes");
+const PaymentMethod = require("../model/paymentMethod");
+const BadRequestError = require("../errors/bad-request-error");
+const NotFoundError = require("../errors/notFoundError");
+
+// --------------------- ADD PAYMENT METHOD --------------------- //
+const addPaymentMethod = async (req, res) => {
+  const { type, provider, last4, expiryMonth, expiryYear, isDefault } =
+    req.body;
+
+  if (!type || !provider || !last4)
+    throw new BadRequestError("Type, provider, and last4 digits are required");
+
+  // If user wants this as default, unset others
+  if (isDefault) {
+    await PaymentMethod.updateMany(
+      { user: req.user.userID, isDefault: true },
+      { $set: { isDefault: false } }
+    );
+  }
+
+  const newMethod = await PaymentMethod.create({
+    user: req.user.userID,
+    type,
+    provider,
+    last4,
+    expiryMonth,
+    expiryYear,
+    isDefault: isDefault || false,
+  });
+
+  res
+    .status(StatusCodes.CREATED)
+    .json({ message: "Payment method added", paymentMethod: newMethod });
+};
+
+// --------------------- GET ALL PAYMENT METHODS --------------------- //
+const getPaymentMethods = async (req, res) => {
+  const methods = await PaymentMethod.find({ user: req.user.userID }).sort({
+    createdAt: -1,
+  });
+
+  res.status(StatusCodes.OK).json({
+    paymentMethods: methods.length
+      ? methods
+      : [{ message: "No saved payment methods" }],
+  });
+};
+
+// --------------------- UPDATE PAYMENT METHOD --------------------- //
+const updatePaymentMethod = async (req, res) => {
+  const { id } = req.params;
+  const { type, provider, last4, expiryMonth, expiryYear, isDefault } =
+    req.body;
+
+  const method = await PaymentMethod.findOne({
+    _id: id,
+    user: req.user.userID,
+  });
+  if (!method) throw new NotFoundError("Payment method not found");
+
+  if (isDefault) {
+    await PaymentMethod.updateMany(
+      { user: req.user.userID, isDefault: true },
+      { $set: { isDefault: false } }
+    );
+  }
+
+  method.type = type || method.type;
+  method.provider = provider || method.provider;
+  method.last4 = last4 || method.last4;
+  method.expiryMonth = expiryMonth || method.expiryMonth;
+  method.expiryYear = expiryYear || method.expiryYear;
+  method.isDefault = isDefault !== undefined ? isDefault : method.isDefault;
+
+  await method.save();
+
+  res
+    .status(StatusCodes.OK)
+    .json({ message: "Payment method updated", paymentMethod: method });
+};
+
+// --------------------- DELETE PAYMENT METHOD --------------------- //
+const deletePaymentMethod = async (req, res) => {
+  const { id } = req.params;
+
+  const deleted = await PaymentMethod.findOneAndDelete({
+    _id: id,
+    user: req.user.userID,
+  });
+  if (!deleted) throw new NotFoundError("Payment method not found");
+
+  res.status(StatusCodes.OK).json({ message: "Payment method deleted" });
+};
+
+module.exports = {
+  addPaymentMethod,
+  getPaymentMethods,
+  updatePaymentMethod,
+  deletePaymentMethod,
+};
+. const Order = require("../model/order");
+const { StatusCodes } = require("http-status-codes");
+const NotFoundError = require("../errors/notFoundError");
+const BadRequestError = require("../errors/bad-request-error");
+const getOrderStatusProgress = require("../utils/orderStatusProgress");
+
+/* =====================================================
+   GET /api/orders (User) — Paginated + Filtering + Search
+   ===================================================== */
+const getUserOrders = async (req, res) => {
+  const userId = req.user.userID; // or req.user.id depending on your auth
+
+  const { page = 1, limit = 10, status, q, startDate, endDate } = req.query;
+
+  const filter = { user: userId };
+
+  if (status) filter.status = status;
+
+  if (q) {
+    // text search on order "items.name" or schema text index
+    filter.$text = { $search: q };
+  }
+
+  if (startDate && endDate) {
+    filter.createdAt = {
+      $gte: new Date(startDate),
+      $lte: new Date(endDate),
+    };
+  }
+
+  const skip = (page - 1) * limit;
+
+  const totalCount = await Order.countDocuments(filter);
+
+  const orders = await Order.find(filter)
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(Number(limit));
+
+  const sanitizedOrders = orders.map((order) => ({
+    id: order._id,
+    items: order.items,
+    totalAmount: order.totalAmount,
+    shippingAddress: order.shippingAddress,
+    status: order.status,
+    statusProgress: getOrderStatusProgress(order.status),
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    events: order.events || [],
+    trackingUrl: order.trackingUrl,
+    courier: order.courier,
+    estimatedDelivery: order.estimatedDelivery,
+  }));
+
+  res.status(StatusCodes.OK).json({
+    totalCount,
+    page: Number(page),
+    pages: Math.ceil(totalCount / limit),
+    count: sanitizedOrders.length,
+    orders: sanitizedOrders.length
+      ? sanitizedOrders
+      : [{ message: "No orders yet" }],
+  });
+};
+
+/* =====================================================
+   GET /api/orders/:id (User)
+   ===================================================== */
+const getOrderById = async (req, res) => {
+  const order = await Order.findOne({
+    _id: req.params.id,
+    user: req.user.userID,
+  });
+
+  if (!order) throw new NotFoundError("Order not found");
+
+  const sanitizedOrder = {
+    id: order._id,
+    items: order.items,
+    totalAmount: order.totalAmount,
+    shippingAddress: order.shippingAddress,
+    status: order.status,
+    statusProgress: getOrderStatusProgress(order.status),
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    events: order.events || [],
+    trackingUrl: order.trackingUrl,
+    courier: order.courier,
+    estimatedDelivery: order.estimatedDelivery,
+  };
+
+  res.status(StatusCodes.OK).json({ order: sanitizedOrder });
+};
+
+/* =====================================================
+   POST /api/orders (User) — Create Order
+   ===================================================== */
+const createOrder = async (req, res) => {
+  const { items, totalAmount, shippingAddress } = req.body;
+
+  if (!items || !items.length || !totalAmount)
+    throw new BadRequestError("Order items and total amount are required");
+
+  const order = await Order.create({
+    user: req.user.userID,
+    items,
+    totalAmount,
+    shippingAddress,
+    status: "pending",
+    events: [{ label: "Order Placed", date: new Date() }],
+  });
+
+  res.status(StatusCodes.CREATED).json({
+    message: "Order created",
+    order: {
+      id: order._id,
+      status: order.status,
+      statusProgress: getOrderStatusProgress(order.status),
+      totalAmount: order.totalAmount,
+      items: order.items,
+      shippingAddress: order.shippingAddress,
+      createdAt: order.createdAt,
+      events: order.events,
+    },
+  });
+};
+
+/* =====================================================
+   PATCH /api/orders/:id/cancel (User)
+   ===================================================== */
+const cancelOrder = async (req, res) => {
+  const order = await Order.findById(req.params.id);
+
+  if (!order) return res.status(404).json({ msg: "Order not found" });
+
+  if (order.user.toString() !== req.user.userID)
+    return res.status(403).json({ msg: "Unauthorized" });
+
+  if (order.status !== "pending")
+    return res.status(400).json({ msg: "Order cannot be cancelled" });
+
+  order.status = "cancelled";
+  order.statusProgress = 0;
+
+  order.events.push({
+    label: "Order Cancelled",
+    date: new Date(),
+  });
+
+  await order.save();
+
+  res.json({
+    msg: "Order cancelled",
+    order: {
+      id: order._id,
+      status: order.status,
+      statusProgress: order.statusProgress,
+      events: order.events,
+    },
+  });
+};
+
+/* =====================================================
+   EXPORT ALL CONTROLLERS
+   ===================================================== */
+module.exports = {
+  getUserOrders,
+  getOrderById,
+  createOrder,
+  cancelOrder,
+};
+const Cart = require("../model/cart");
+const Product = require("../model/product");
+const BadRequestError = require("../errors/bad-request-error");
+const NotFoundError = require("../errors/notFoundError");
+
+// Calculate total price with discounts, taxes, shipping
+const calcTotal = (items, taxRate = 0.05, shipping = 0) => {
+  const subtotal = items.reduce((sum, i) => {
+    const price = i.product.price || 0;
+    const discountedPrice = price * (1 - (i.discount || 0) / 100);
+    return sum + discountedPrice * i.quantity;
+  }, 0);
+  const tax = subtotal * taxRate;
+  return parseFloat((subtotal + tax + shipping).toFixed(2));
+};
+
+// ------------------- AUTH CHECK -------------------
+const ensureAuth = (req) => {
+  if (!req.user || !req.user._id)
+    throw new BadRequestError("Authentication required");
+};
+
+// =======================
+// USER ROUTES
+// =======================
+
+const getCart = async (req, res) => {
+  ensureAuth(req);
+  const cart = await Cart.findOne({ user: req.user._id }).populate(
+    "items.product"
+  );
+  if (!cart) return res.status(200).json({ items: [], total: 0 });
+  res.status(200).json({ items: cart.items, total: calcTotal(cart.items) });
+};
+
+const addToCart = async (req, res) => {
+  ensureAuth(req);
+  const { productId, quantity = 1, selectedColor, selectedSize } = req.body;
+
+  if (quantity < 1) throw new BadRequestError("Quantity must be at least 1");
+
+  const product = await Product.findById(productId);
+  if (!product) throw new NotFoundError("Product not found");
+  if (product.stock < quantity) throw new BadRequestError("Insufficient stock");
+
+  let cart = await Cart.findOne({ user: req.user._id });
+  if (!cart) cart = new Cart({ user: req.user._id, items: [] });
+
+  const existing = cart.items.find(
+    (i) =>
+      i.product.toString() === productId &&
+      i.selectedColor === (selectedColor || null) &&
+      i.selectedSize === (selectedSize || null)
+  );
+
+  const discount = product.discount || 0;
+
+  if (existing) {
+    existing.quantity = Math.min(existing.quantity + quantity, product.stock);
+    existing.discount = discount;
+  } else {
+    cart.items.push({
+      product: productId,
+      quantity,
+      selectedColor,
+      selectedSize,
+      discount,
+    });
+  }
+
+  await cart.save();
+  await cart.populate("items.product");
+  res.status(200).json({ items: cart.items, total: calcTotal(cart.items) });
+};
+
+const updateCartItem = async (req, res) => {
+  ensureAuth(req);
+  const { quantity, selectedColor, selectedSize } = req.body;
+  const { productId } = req.params;
+
+  const product = await Product.findById(productId);
+  if (!product) throw new NotFoundError("Product not found");
+
+  const cart = await Cart.findOne({ user: req.user._id });
+  if (!cart) throw new NotFoundError("Cart not found");
+
+  const item = cart.items.find(
+    (i) =>
+      i.product.toString() === productId &&
+      i.selectedColor === (selectedColor || null) &&
+      i.selectedSize === (selectedSize || null)
+  );
+  if (!item) throw new NotFoundError("Item not found in cart");
+
+  if (quantity) item.quantity = Math.min(Math.max(1, quantity), product.stock);
+  item.discount = product.discount || 0;
+
+  await cart.save();
+  await cart.populate("items.product");
+  res.status(200).json({ items: cart.items, total: calcTotal(cart.items) });
+};
+
+const removeCartItem = async (req, res) => {
+  ensureAuth(req);
+  const { productId } = req.params;
+  const { selectedColor, selectedSize } = req.body;
+
+  const cart = await Cart.findOne({ user: req.user._id });
+  if (!cart) throw new NotFoundError("Cart not found");
+
+  cart.items = cart.items.filter(
+    (i) =>
+      !(
+        i.product.toString() === productId &&
+        i.selectedColor === (selectedColor || null) &&
+        i.selectedSize === (selectedSize || null)
+      )
+  );
+
+  await cart.save();
+  await cart.populate("items.product");
+  res.status(200).json({ items: cart.items, total: calcTotal(cart.items) });
+};
+
+const syncCart = async (req, res) => {
+  ensureAuth(req);
+  const { items } = req.body;
+  let cart = await Cart.findOne({ user: req.user._id });
+  if (!cart) cart = new Cart({ user: req.user._id, items: [] });
+
+  cart.items = await Promise.all(
+    items.map(async (i) => {
+      const product = await Product.findById(i.product._id || i.product);
+      if (!product) return null;
+      return {
+        product: product._id,
+        quantity: Math.min(i.quantity, product.stock),
+        selectedColor: i.selectedColor || null,
+        selectedSize: i.selectedSize || null,
+        discount: product.discount || 0,
+      };
+    })
+  );
+
+  cart.items = cart.items.filter(Boolean);
+  await cart.save();
+  await cart.populate("items.product");
+  res.status(200).json({ items: cart.items, total: calcTotal(cart.items) });
+};
+
+// =======================
+// ADMIN ROUTES
+// =======================
+
+const getAllCarts = async (req, res) => {
+  const carts = await Cart.find().populate("items.product user");
+  res.status(200).json({ carts });
+};
+
+const applyGlobalDiscount = async (req, res) => {
+  const { discount } = req.body;
+  if (!discount || discount < 0 || discount > 100)
+    throw new BadRequestError("Invalid discount value");
+
+  const carts = await Cart.find().populate("items.product");
+  for (const cart of carts) {
+    cart.items.forEach((item) => (item.discount = discount));
+    await cart.save();
+  }
+
+  res
+    .status(200)
+    .json({ message: `Global discount of ${discount}% applied to all carts` });
+};
+
+// =======================
+// EXPORT ALL
+// =======================
+
+module.exports = {
+  getCart,
+  addToCart,
+  updateCartItem,
+  removeCartItem,
+  syncCart,
+  getAllCarts,
+  applyGlobalDiscount,
+};
+ 
+ 
+ 
+// const { StatusCodes } = require("http-status-codes");
+// const Address = require("../model/address");
+// const BadRequestError = require("../errors/bad-request-error");
+// const NotFoundError = require("../errors/notFoundError");
+// const { logActivity } = require("../utils/activityLogger");
+// const yup = require("yup");
+// const axios = require("axios");
+
+// // -------------------- VALIDATION SCHEMA --------------------
+// const addressSchema = yup.object().shape({
+//   fullName: yup.string().required("Full name is required"),
+//   phone: yup.string().required("Phone number is required"),
+//   addressLine1: yup.string().required("Address line 1 is required"),
+//   addressLine2: yup.string(),
+//   city: yup.string().required("City is required"),
+//   state: yup.string().required("State is required"),
+//   country: yup.string(),
+//   postalCode: yup.string(),
+//   isDefault: yup.boolean(),
+// });
+
+// // -------------------- SANITIZE PAYLOAD --------------------
+// const allowedFields = [
+//   "fullName",
+//   "phone",
+//   "addressLine1",
+//   "addressLine2",
+//   "city",
+//   "state",
+//   "country",
+//   "postalCode",
+//   "isDefault",
+// ];
+
+// const sanitizePayload = (data) => {
+//   const clean = {};
+//   for (const key of allowedFields) {
+//     if (data[key] !== undefined) clean[key] = data[key];
+//   }
+//   return clean;
+// };
+
+// // -------------------- AUTO-LOCATION (IP → Country/City) --------------------
+// const detectLocation = async (ip) => {
+//   try {
+//     // Use free IP geolocation API or Google Maps API
+//     const res = await axios.get(`https://ipapi.co/${ip}/json/`);
+//     return {
+//       city: res.data.city || "",
+//       state: res.data.region || "",
+//       country: res.data.country_name || "",
+//     };
+//   } catch (err) {
+//     return { city: "", state: "", country: "" }; // fallback
+//   }
+// };
+
+// // -------------------- LIST ADDRESSES --------------------
+// const listAddresses = async (req, res, next) => {
+//   try {
+//     const addresses = await Address.find({ user: req.user.userID }).sort({
+//       isDefault: -1,
+//       createdAt: -1,
+//     });
+
+//     res.status(StatusCodes.OK).json({
+//       count: addresses.length,
+//       addresses,
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- GET SINGLE ADDRESS --------------------
+// const getAddress = async (req, res, next) => {
+//   try {
+//     const address = await Address.findOne({
+//       _id: req.params.id,
+//       user: req.user.userID,
+//     });
+//     if (!address) throw new NotFoundError("Address not found");
+//     res.status(StatusCodes.OK).json({ address });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- CREATE ADDRESS --------------------
+// const createAddress = async (req, res, next) => {
+//   try {
+//     let data = sanitizePayload(req.body);
+
+//     // Auto-fill country/city/state if missing using IP
+//     if (!data.country || !data.city || !data.state) {
+//       const location = await detectLocation(req.ip);
+//       data = { ...location, ...data };
+//     }
+
+//     await addressSchema.validate(data, { abortEarly: false });
+
+//     // If new address is default, unset previous defaults
+//     if (data.isDefault) {
+//       await Address.updateMany(
+//         { user: req.user.userID, isDefault: true },
+//         { isDefault: false }
+//       );
+//     }
+
+//     const address = await Address.create({ ...data, user: req.user.userID });
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "ADDRESS_CREATE",
+//       description: "Created new address",
+//       meta: { addressId: address._id },
+//       ipAddress: req.ip,
+//     });
+
+//     res.status(StatusCodes.CREATED).json({
+//       message: "Address created successfully",
+//       address,
+//     });
+//   } catch (err) {
+//     if (err.name === "ValidationError" || err.name === "AggregateError") {
+//       return next(new BadRequestError(err.errors.join(", ")));
+//     }
+//     next(err);
+//   }
+// };
+
+// // -------------------- UPDATE ADDRESS --------------------
+// const updateAddress = async (req, res, next) => {
+//   try {
+//     const data = sanitizePayload(req.body);
+//     if (Object.keys(data).length === 0)
+//       throw new BadRequestError("No valid fields to update");
+
+//     await addressSchema.validate(data, { abortEarly: false });
+
+//     // If setting default, unset others
+//     if (data.isDefault) {
+//       await Address.updateMany(
+//         { user: req.user.userID, isDefault: true },
+//         { isDefault: false }
+//       );
+//     }
+
+//     const address = await Address.findOneAndUpdate(
+//       { _id: req.params.id, user: req.user.userID },
+//       data,
+//       { new: true, runValidators: true }
+//     );
+
+//     if (!address) throw new NotFoundError("Address not found");
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "ADDRESS_UPDATE",
+//       description: "Updated address",
+//       meta: { addressId: req.params.id },
+//       ipAddress: req.ip,
+//     });
+
+//     res.status(StatusCodes.OK).json({
+//       message: "Address updated successfully",
+//       address,
+//     });
+//   } catch (err) {
+//     if (err.name === "ValidationError" || err.name === "AggregateError") {
+//       return next(new BadRequestError(err.errors.join(", ")));
+//     }
+//     next(err);
+//   }
+// };
+
+// // -------------------- DELETE ADDRESS --------------------
+// const deleteAddress = async (req, res, next) => {
+//   try {
+//     const deleted = await Address.findOneAndDelete({
+//       _id: req.params.id,
+//       user: req.user.userID,
+//     });
+//     if (!deleted) throw new NotFoundError("Address not found");
+
+//     // If default deleted, set another default
+//     if (deleted.isDefault) {
+//       await Address.findOneAndUpdate(
+//         { user: req.user.userID },
+//         { isDefault: true }
+//       );
+//     }
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "ADDRESS_DELETE",
+//       description: "Deleted address",
+//       meta: { addressId: req.params.id },
+//       ipAddress: req.ip,
+//     });
+
+//     res
+//       .status(StatusCodes.OK)
+//       .json({ message: "Address deleted successfully" });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// module.exports = {
+//   listAddresses,
+//   getAddress,
+//   createAddress,
+//   updateAddress,
+//   deleteAddress,
+// }; . const { StatusCodes } = require("http-status-codes");
+// const ActivityLog = require("../model/activityLog");
+
+// const listActivities = async (req, res, next) => {
+//   try {
+//     // Pagination
+//     const page = Math.max(parseInt(req.query.page) || 1, 1);
+//     const limit = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 100); // max 100
+//     const skip = (page - 1) * limit;
+
+//     // Filters
+//     const { type, startDate, endDate, keyword } = req.query;
+//     const query = { user: req.user.userID };
+
+//     if (type) query.type = type;
+
+//     if (startDate || endDate) {
+//       query.createdAt = {};
+//       if (startDate) query.createdAt.$gte = new Date(startDate);
+//       if (endDate) query.createdAt.$lte = new Date(endDate);
+//     }
+
+//     if (keyword) {
+//       query.$or = [
+//         { description: { $regex: keyword, $options: "i" } },
+//         { "meta.value": { $regex: keyword, $options: "i" } }, // if meta has value fields
+//       ];
+//     }
+
+//     // Sorting
+//     const sortField = req.query.sortBy || "createdAt";
+//     const sortOrder = req.query.order === "asc" ? 1 : -1;
+
+//     const [logs, totalCount] = await Promise.all([
+//       ActivityLog.find(query)
+//         .sort({ [sortField]: sortOrder })
+//         .skip(skip)
+//         .limit(limit),
+//       ActivityLog.countDocuments(query),
+//     ]);
+
+//     res.status(StatusCodes.OK).json({
+//       page,
+//       limit,
+//       totalCount,
+//       totalPages: Math.ceil(totalCount / limit),
+//       count: logs.length,
+//       logs,
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// module.exports = { listActivities };
+// const Cart = require("../model/cart");
+// const Product = require("../model/product");
+// const BadRequestError = require("../errors/bad-request-error");
+// const NotFoundError = require("../errors/notFoundError");
+
+// // Calculate total price with discounts, taxes, shipping
+// const calcTotal = (items, taxRate = 0.05, shipping = 0) => {
+//   const subtotal = items.reduce((sum, i) => {
+//     const price = i.product.price || 0;
+//     const discountedPrice = price * (1 - (i.discount || 0) / 100);
+//     return sum + discountedPrice * i.quantity;
+//   }, 0);
+//   const tax = subtotal * taxRate;
+//   return parseFloat((subtotal + tax + shipping).toFixed(2));
+// };
+
+// // ------------------- AUTH CHECK -------------------
+// const ensureAuth = (req) => {
+//   if (!req.user || !req.user._id)
+//     throw new BadRequestError("Authentication required");
+// };
+
+// // =======================
+// // USER ROUTES
+// // =======================
+
+// const getCart = async (req, res) => {
+//   ensureAuth(req);
+//   const cart = await Cart.findOne({ user: req.user._id }).populate(
+//     "items.product"
+//   );
+//   if (!cart) return res.status(200).json({ items: [], total: 0 });
+//   res.status(200).json({ items: cart.items, total: calcTotal(cart.items) });
+// };
+
+// const addToCart = async (req, res) => {
+//   ensureAuth(req);
+//   const { productId, quantity = 1, selectedColor, selectedSize } = req.body;
+
+//   if (quantity < 1) throw new BadRequestError("Quantity must be at least 1");
+
+//   const product = await Product.findById(productId);
+//   if (!product) throw new NotFoundError("Product not found");
+//   if (product.stock < quantity) throw new BadRequestError("Insufficient stock");
+
+//   let cart = await Cart.findOne({ user: req.user._id });
+//   if (!cart) cart = new Cart({ user: req.user._id, items: [] });
+
+//   const existing = cart.items.find(
+//     (i) =>
+//       i.product.toString() === productId &&
+//       i.selectedColor === (selectedColor || null) &&
+//       i.selectedSize === (selectedSize || null)
+//   );
+
+//   const discount = product.discount || 0;
+
+//   if (existing) {
+//     existing.quantity = Math.min(existing.quantity + quantity, product.stock);
+//     existing.discount = discount;
+//   } else {
+//     cart.items.push({
+//       product: productId,
+//       quantity,
+//       selectedColor,
+//       selectedSize,
+//       discount,
+//     });
+//   }
+
+//   await cart.save();
+//   await cart.populate("items.product");
+//   res.status(200).json({ items: cart.items, total: calcTotal(cart.items) });
+// };
+
+// const updateCartItem = async (req, res) => {
+//   ensureAuth(req);
+//   const { quantity, selectedColor, selectedSize } = req.body;
+//   const { productId } = req.params;
+
+//   const product = await Product.findById(productId);
+//   if (!product) throw new NotFoundError("Product not found");
+
+//   const cart = await Cart.findOne({ user: req.user._id });
+//   if (!cart) throw new NotFoundError("Cart not found");
+
+//   const item = cart.items.find(
+//     (i) =>
+//       i.product.toString() === productId &&
+//       i.selectedColor === (selectedColor || null) &&
+//       i.selectedSize === (selectedSize || null)
+//   );
+//   if (!item) throw new NotFoundError("Item not found in cart");
+
+//   if (quantity) item.quantity = Math.min(Math.max(1, quantity), product.stock);
+//   item.discount = product.discount || 0;
+
+//   await cart.save();
+//   await cart.populate("items.product");
+//   res.status(200).json({ items: cart.items, total: calcTotal(cart.items) });
+// };
+
+// const removeCartItem = async (req, res) => {
+//   ensureAuth(req);
+//   const { productId } = req.params;
+//   const { selectedColor, selectedSize } = req.body;
+
+//   const cart = await Cart.findOne({ user: req.user._id });
+//   if (!cart) throw new NotFoundError("Cart not found");
+
+//   cart.items = cart.items.filter(
+//     (i) =>
+//       !(
+//         i.product.toString() === productId &&
+//         i.selectedColor === (selectedColor || null) &&
+//         i.selectedSize === (selectedSize || null)
+//       )
+//   );
+
+//   await cart.save();
+//   await cart.populate("items.product");
+//   res.status(200).json({ items: cart.items, total: calcTotal(cart.items) });
+// };
+
+// const syncCart = async (req, res) => {
+//   ensureAuth(req);
+//   const { items } = req.body;
+//   let cart = await Cart.findOne({ user: req.user._id });
+//   if (!cart) cart = new Cart({ user: req.user._id, items: [] });
+
+//   cart.items = await Promise.all(
+//     items.map(async (i) => {
+//       const product = await Product.findById(i.product._id || i.product);
+//       if (!product) return null;
+//       return {
+//         product: product._id,
+//         quantity: Math.min(i.quantity, product.stock),
+//         selectedColor: i.selectedColor || null,
+//         selectedSize: i.selectedSize || null,
+//         discount: product.discount || 0,
+//       };
+//     })
+//   );
+
+//   cart.items = cart.items.filter(Boolean);
+//   await cart.save();
+//   await cart.populate("items.product");
+//   res.status(200).json({ items: cart.items, total: calcTotal(cart.items) });
+// };
+
+// // =======================
+// // ADMIN ROUTES
+// // =======================
+
+// const getAllCarts = async (req, res) => {
+//   const carts = await Cart.find().populate("items.product user");
+//   res.status(200).json({ carts });
+// };
+
+// const applyGlobalDiscount = async (req, res) => {
+//   const { discount } = req.body;
+//   if (!discount || discount < 0 || discount > 100)
+//     throw new BadRequestError("Invalid discount value");
+
+//   const carts = await Cart.find().populate("items.product");
+//   for (const cart of carts) {
+//     cart.items.forEach((item) => (item.discount = discount));
+//     await cart.save();
+//   }
+
+//   res
+//     .status(200)
+//     .json({ message: `Global discount of ${discount}% applied to all carts` });
+// };
+
+// // =======================
+// // EXPORT ALL
+// // =======================
+
+// module.exports = {
+//   getCart,
+//   addToCart,
+//   updateCartItem,
+//   removeCartItem,
+//   syncCart,
+//   getAllCarts,
+//   applyGlobalDiscount,
+// }; . const { StatusCodes } = require("http-status-codes");
+// const User = require("../model/userModel");
+// const WishlistItem = require("../model/WishlistItem");
+// const Notification = require("../model/notification");
+// const Session = require("../model/session");
+// const Order = require("../model/order");
+// const Payment = require("../model/payment");
+// const PaymentMethod = require("../model/paymentMethod");
+// const Address = require("../model/address");
+// const RecentlyViewed = require("../model/recentlyViewed");
+// const SupportTicket = require("../model/supportTicket");
+// const ActivityLog = require("../model/activityLog");
+// const LoyaltyHistory = require("../model/loyaltyHistory");
+// const BadRequestError = require("../errors/bad-request-error");
+// const NotFoundError = require("../errors/notFoundError");
+// const cloudinary = require("../config/cloudinary");
+// const pdf = require("pdfkit");
+// const fs = require("fs");
+// const path = require("path");
+
+// // --------------------- DASHBOARD --------------------- //
+// const getUserDashboard = async (req, res, next) => {
+//   const userId = req.user.userID;
+
+//   const wishlistPage = parseInt(req.query.wishlistPage) || 1;
+//   const ordersPage = parseInt(req.query.ordersPage) || 1;
+//   const notificationsPage = parseInt(req.query.notificationsPage) || 1;
+//   const paymentsPage = parseInt(req.query.paymentsPage) || 1;
+//   const sessionsPage = parseInt(req.query.sessionsPage) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+
+//   const skipWishlist = (wishlistPage - 1) * limit;
+//   const skipOrders = (ordersPage - 1) * limit;
+//   const skipNotifications = (notificationsPage - 1) * limit;
+//   const skipPayments = (paymentsPage - 1) * limit;
+//   const skipSessions = (sessionsPage - 1) * limit;
+
+//   try {
+//     const [
+//       wishlistCount,
+//       ordersSummary,
+//       paymentsSummary,
+//       notificationsCount,
+//       loyaltyPoints,
+//     ] = await Promise.all([
+//       WishlistItem.countDocuments({ user: userId }),
+//       Order.aggregate([
+//         { $match: { user: userId } },
+//         {
+//           $group: {
+//             _id: "$user",
+//             totalOrders: { $sum: 1 },
+//             totalSpent: { $sum: "$totalAmount" },
+//           },
+//         },
+//       ]),
+//       Payment.aggregate([
+//         { $match: { user: userId } },
+//         { $group: { _id: "$user", totalPayments: { $sum: "$amount" } } },
+//       ]),
+//       Notification.countDocuments({ user: userId, read: false }),
+//       User.findById(userId).select("loyaltyPoints"),
+//     ]);
+
+//     const [
+//       wishlist,
+//       orders,
+//       notifications,
+//       sessions,
+//       payments,
+//       paymentMethods,
+//       addresses,
+//       recentlyViewed,
+//       tickets,
+//       activities,
+//       loyaltyHistory,
+//       recommendedProducts,
+//     ] = await Promise.all([
+//       WishlistItem.find({ user: userId })
+//         .skip(skipWishlist)
+//         .limit(limit)
+//         .populate("product"),
+//       Order.find({ user: userId })
+//         .skip(skipOrders)
+//         .limit(limit)
+//         .sort({ createdAt: -1 }),
+//       Notification.find({ user: userId })
+//         .skip(skipNotifications)
+//         .limit(limit)
+//         .sort({ createdAt: -1 }),
+//       Session.find({ user: userId, valid: true })
+//         .skip(skipSessions)
+//         .limit(limit)
+//         .sort({ createdAt: -1 }),
+//       Payment.find({ user: userId })
+//         .skip(skipPayments)
+//         .limit(limit)
+//         .sort({ createdAt: -1 }),
+//       PaymentMethod.find({ user: userId }).sort({
+//         isDefault: -1,
+//         createdAt: -1,
+//       }),
+//       Address.find({ user: userId }).sort({ createdAt: -1 }),
+//       RecentlyViewed.find({ user: userId })
+//         .populate("product")
+//         .sort({ createdAt: -1 })
+//         .limit(10),
+//       SupportTicket.find({ user: userId }).sort({ createdAt: -1 }),
+//       ActivityLog.find({ user: userId }).sort({ createdAt: -1 }).limit(10),
+//       LoyaltyHistory.find({ user: userId }).sort({ createdAt: -1 }).limit(10),
+//       WishlistItem.find({ user: userId })
+//         .populate("product")
+//         .then((items) => items.map((i) => i.product).slice(0, 5)),
+//     ]);
+
+//     res.status(StatusCodes.OK).json({
+//       summary: {
+//         wishlistCount: wishlistCount || 0,
+//         totalOrders: ordersSummary[0]?.totalOrders || 0,
+//         totalSpent: ordersSummary[0]?.totalSpent || 0,
+//         totalPayments: paymentsSummary[0]?.totalPayments || 0,
+//         unreadNotifications: notificationsCount || 0,
+//         loyaltyPoints: loyaltyPoints?.loyaltyPoints || 0,
+//       },
+//       wishlist: wishlist.length
+//         ? wishlist
+//         : [{ message: "Your wishlist is empty" }],
+//       orders: orders.length ? orders : [{ message: "No orders yet" }],
+//       payments: payments.length
+//         ? payments
+//         : [{ message: "No payment history yet" }],
+//       notifications: notifications.length
+//         ? notifications
+//         : [{ message: "No notifications yet" }],
+//       sessions: sessions.length
+//         ? sessions
+//         : [{ message: "No active sessions yet" }],
+//       savedPaymentMethods: paymentMethods.length
+//         ? paymentMethods
+//         : [{ message: "No saved payment methods" }],
+//       addresses: addresses.length
+//         ? addresses
+//         : [{ message: "No saved addresses yet" }],
+//       recentlyViewed: recentlyViewed.length
+//         ? recentlyViewed
+//         : [{ message: "No recently viewed products" }],
+//       supportTickets: tickets.length
+//         ? tickets
+//         : [{ message: "No support tickets yet" }],
+//       activityLog: activities.length
+//         ? activities
+//         : [{ message: "No recent activity yet" }],
+//       loyaltyHistory: loyaltyHistory.length
+//         ? loyaltyHistory
+//         : [{ message: "No loyalty history yet" }],
+//       recommendedProducts: recommendedProducts.length
+//         ? recommendedProducts
+//         : [{ message: "No recommendations yet" }],
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // --------------------- PROFILE --------------------- //
+// const updateProfile = async (req, res) => {
+//   const { username, email, phone } = req.body;
+//   if (!username && !email && !phone)
+//     throw new BadRequestError("At least one field is required");
+
+//   const updatedUser = await User.findByIdAndUpdate(
+//     req.user.userID,
+//     { username, email, phone },
+//     { new: true, runValidators: true }
+//   );
+//   if (!updatedUser) throw new NotFoundError("User not found");
+
+//   res
+//     .status(StatusCodes.OK)
+//     .json({ message: "Profile updated", user: updatedUser });
+// };
+
+// const changePassword = async (req, res) => {
+//   const { oldPassword, newPassword } = req.body;
+//   if (!oldPassword || !newPassword)
+//     throw new BadRequestError("Both old and new passwords are required");
+
+//   const user = await User.findById(req.user.userID);
+//   if (!user) throw new NotFoundError("User not found");
+
+//   const isMatch = await user.comparePassword(oldPassword);
+//   if (!isMatch) throw new BadRequestError("Old password incorrect");
+
+//   user.password = newPassword;
+//   await user.save();
+
+//   res.status(StatusCodes.OK).json({ message: "Password updated successfully" });
+// };
+
+// // --------------------- ACCOUNT --------------------- //
+// const deleteAccount = async (req, res) => {
+//   const deleted = await User.findByIdAndDelete(req.user.userID);
+//   if (!deleted) throw new NotFoundError("User not found");
+
+//   res
+//     .clearCookie("token")
+//     .status(StatusCodes.OK)
+//     .json({ message: "Account deleted successfully" });
+// };
+
+// const logout = async (req, res) => {
+//   await Session.updateOne({ _id: req.sessionID }, { valid: false });
+//   res
+//     .clearCookie("token")
+//     .status(StatusCodes.OK)
+//     .json({ message: "Logout successful" });
+// };
+
+// const revokeSession = async (req, res) => {
+//   const { sessionId } = req.params;
+//   const session = await Session.findOne({
+//     _id: sessionId,
+//     user: req.user.userID,
+//   });
+//   if (!session) throw new NotFoundError("Session not found");
+
+//   session.valid = false;
+//   await session.save();
+//   res.status(StatusCodes.OK).json({ message: "Session revoked successfully" });
+// };
+// // GET USER SESSIONS
+// const getSessions = async (req, res) => {
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 10;
+//   const skip = (page - 1) * limit;
+
+//   const sessions = await Session.find({ user: req.user.userID })
+//     .skip(skip)
+//     .limit(limit)
+//     .sort({ createdAt: -1 });
+
+//   if (!sessions.length) {
+//     return res.status(StatusCodes.OK).json({
+//       sessions: [{ message: "No active sessions yet" }],
+//     });
+//   }
+
+//   res.status(StatusCodes.OK).json({
+//     count: sessions.length,
+//     sessions,
+//   });
+// };
+// const revokeAllSessions = async (req, res) => {
+//   await Session.updateMany({ user: req.user.userID }, { valid: false });
+//   res
+//     .status(StatusCodes.OK)
+//     .json({ message: "All sessions revoked successfully" });
+// };
+
+// // --------------------- PROFILE PICTURE --------------------- //
+// const uploadProfilePic = async (req, res, next) => {
+//   try {
+//     if (!req.file) throw new BadRequestError("No file uploaded");
+
+//     const result = await cloudinary.uploader.upload(req.file.path, {
+//       folder: "users/profilePics",
+//       transformation: [{ width: 400, height: 400, crop: "fill" }],
+//     });
+//     const updatedUser = await User.findByIdAndUpdate(
+//       req.user.userID,
+//       { profilePic: result.secure_url },
+//       { new: true }
+//     ).select("-password");
+
+//     if (!updatedUser) throw new NotFoundError("User not found");
+
+//     res.status(StatusCodes.OK).json({
+//       message: "Profile picture uploaded successfully",
+//       user: updatedUser,
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // --------------------- WISHLIST --------------------- //
+// const getWishlist = async (req, res) => {
+//   const wishlist = await WishlistItem.find({ user: req.user.userID }).populate(
+//     "product"
+//   );
+//   res.status(StatusCodes.OK).json({
+//     wishlist: wishlist.length
+//       ? wishlist
+//       : [{ message: "Your wishlist is empty" }],
+//   });
+// };
+
+// const addToWishlist = async (req, res) => {
+//   const { productId } = req.body;
+//   if (!productId) throw new BadRequestError("Product ID is required");
+
+//   const exists = await WishlistItem.findOne({
+//     user: req.user.userID,
+//     product: productId,
+//   });
+//   if (exists) throw new BadRequestError("Product already in wishlist");
+
+//   const wishlistItem = await WishlistItem.create({
+//     user: req.user.userID,
+//     product: productId,
+//   });
+//   res
+//     .status(StatusCodes.CREATED)
+//     .json({ message: "Added to wishlist", wishlistItem });
+// };
+
+// const removeFromWishlist = async (req, res) => {
+//   const { id } = req.params;
+//   const deleted = await WishlistItem.findOneAndDelete({
+//     _id: id,
+//     user: req.user.userID,
+//   });
+//   if (!deleted) throw new NotFoundError("Wishlist item not found");
+
+//   res.status(StatusCodes.OK).json({ message: "Removed from wishlist" });
+// };
+
+// // --------------------- NOTIFICATIONS --------------------- //
+// const getNotifications = async (req, res) => {
+//   const notifications = await Notification.find({ user: req.user.userID }).sort(
+//     { createdAt: -1 }
+//   );
+//   res.status(StatusCodes.OK).json({
+//     notifications: notifications.length
+//       ? notifications
+//       : [{ message: "No notifications" }],
+//   });
+// };
+
+// const markAsRead = async (req, res) => {
+//   const { id } = req.params;
+//   const notification = await Notification.findOne({
+//     _id: id,
+//     user: req.user.userID,
+//   });
+//   if (!notification) throw new NotFoundError("Notification not found");
+
+//   notification.read = true;
+//   await notification.save();
+//   res.status(StatusCodes.OK).json({ message: "Notification marked as read" });
+// };
+
+// const markAllRead = async (req, res) => {
+//   await Notification.updateMany(
+//     { user: req.user.userID, read: false },
+//     { read: true }
+//   );
+//   res
+//     .status(StatusCodes.OK)
+//     .json({ message: "All notifications marked as read" });
+// };
+
+// // Generate downloadable receipt
+// const downloadReceipt = async (req, res) => {
+//   const payment = await Payment.findOne({
+//     _id: req.params.id,
+//     user: req.user.userID,
+//   }).populate("order");
+//   if (!payment) throw new NotFoundError("Payment not found");
+
+//   const doc = new pdf();
+//   const filePath = path.join(__dirname, `../temp/receipt-${payment._id}.pdf`);
+//   doc.pipe(fs.createWriteStream(filePath));
+//   doc.fontSize(20).text("Payment Receipt", { align: "center" });
+//   doc.moveDown();
+//   doc.fontSize(14).text(`Payment ID: ${payment._id}`);
+//   doc.text(`Amount: $${payment.amount}`);
+//   doc.text(`Method: ${payment.method}`);
+//   doc.text(`Date: ${payment.createdAt.toDateString()}`);
+//   doc.text(`Order ID: ${payment.order?._id || "N/A"}`);
+//   doc.end();
+
+//   doc.on("finish", () =>
+//     res.download(filePath, `receipt-${payment._id}.pdf`, () =>
+//       fs.unlinkSync(filePath)
+//     )
+//   );
+// };
+
+// // --------------------- PAYMENTS --------------------- //
+// const getUserPayments = async (req, res) => {
+//   const payments = await Payment.find({ user: req.user.userID }).sort({
+//     createdAt: -1,
+//   });
+//   res.status(StatusCodes.OK).json({
+//     payments: payments.length
+//       ? payments
+//       : [{ message: "No payment history yet" }],
+//   });
+// };
+
+// // --------------------- EXPORT --------------------- //
+// module.exports = {
+//   getUserDashboard,
+//   updateProfile,
+//   changePassword,
+//   deleteAccount,
+//   logout,
+//   revokeSession,
+//   revokeAllSessions,
+//   uploadProfilePic,
+//   getSessions,
+//   downloadReceipt,
+//   getUserPayments,
+//   getWishlist,
+//   addToWishlist,
+//   removeFromWishlist,
+//   getNotifications,
+//   markAsRead,
+//   markAllRead,
+// }; .const { StatusCodes } = require("http-status-codes");
+// const LoyaltyHistory = require("../model/loyaltyHistory");
+// const User = require("../model/userModel");
+// const BadRequestError = require("../errors/bad-request-error");
+// const NotFoundError = require("../errors/notFoundError");
+// const { logActivity } = require("../utils/activityLogger");
+
+// // -------------------- GET LOYALTY HISTORY --------------------
+// const getLoyaltyHistory = async (req, res, next) => {
+//   try {
+//     const page = Math.max(parseInt(req.query.page) || 1, 1);
+//     const limit = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 100);
+//     const skip = (page - 1) * limit;
+
+//     const query = { user: req.user.userID };
+//     if (req.query.orderId) query.order = req.query.orderId;
+//     if (req.query.type) query.type = req.query.type; // earn or redeem
+
+//     const [history, totalCount] = await Promise.all([
+//       LoyaltyHistory.find(query)
+//         .sort({ createdAt: -1 })
+//         .skip(skip)
+//         .limit(limit),
+//       LoyaltyHistory.countDocuments(query),
+//     ]);
+
+//     res.status(StatusCodes.OK).json({
+//       page,
+//       limit,
+//       totalCount,
+//       totalPages: Math.ceil(totalCount / limit),
+//       count: history.length,
+//       history,
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- AWARD POINTS --------------------
+// const awardPoints = async (req, res, next) => {
+//   try {
+//     const { points, description, orderId, type } = req.body;
+//     if (!points || !description)
+//       throw new BadRequestError("points and description required");
+
+//     const user = await User.findById(req.user.userID);
+//     if (!user) throw new NotFoundError("User not found");
+
+//     const addedPoints = Number(points);
+//     user.loyaltyPoints = (user.loyaltyPoints || 0) + addedPoints;
+//     await user.save();
+
+//     const entry = await LoyaltyHistory.create({
+//       user: req.user.userID,
+//       points: addedPoints,
+//       type: type || "earn",
+//       description,
+//       order: orderId || null,
+//     });
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "loyalty",
+//       description: `Awarded ${addedPoints} loyalty points`,
+//       meta: { entryId: entry._id, orderId: orderId || null },
+//       ipAddress: req.ip,
+//     });
+
+//     res.status(StatusCodes.CREATED).json({
+//       message: "Points awarded",
+//       entry,
+//       loyaltyPoints: user.loyaltyPoints,
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- REDEEM POINTS --------------------
+// const redeemPoints = async (req, res, next) => {
+//   try {
+//     const { points, description } = req.body;
+//     if (!points || !description)
+//       throw new BadRequestError("points and description required");
+
+//     const user = await User.findById(req.user.userID);
+//     if (!user) throw new NotFoundError("User not found");
+
+//     const redeemPoints = Number(points);
+//     if ((user.loyaltyPoints || 0) < redeemPoints)
+//       throw new BadRequestError("Insufficient points");
+
+//     user.loyaltyPoints -= redeemPoints;
+//     await user.save();
+
+//     const entry = await LoyaltyHistory.create({
+//       user: req.user.userID,
+//       points: redeemPoints,
+//       type: "redeem",
+//       description,
+//     });
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "loyalty",
+//       description: `Redeemed ${redeemPoints} loyalty points`,
+//       meta: { entryId: entry._id },
+//       ipAddress: req.ip,
+//     });
+
+//     res.status(StatusCodes.OK).json({
+//       message: "Points redeemed",
+//       entry,
+//       loyaltyPoints: user.loyaltyPoints,
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- ADJUST POINTS (ADMIN) --------------------
+// const adjustPoints = async (req, res, next) => {
+//   try {
+//     const { userId, points, description } = req.body;
+//     if (!userId || !points || !description)
+//       throw new BadRequestError("userId, points, and description are required");
+
+//     const user = await User.findById(userId);
+//     if (!user) throw new NotFoundError("User not found");
+
+//     const newPoints = Number(points);
+//     if (user.loyaltyPoints + newPoints < 0)
+//       throw new BadRequestError("Cannot reduce points below 0");
+
+//     user.loyaltyPoints += newPoints;
+//     await user.save();
+
+//     const entry = await LoyaltyHistory.create({
+//       user: userId,
+//       points: newPoints,
+//       type: newPoints >= 0 ? "earn" : "redeem",
+//       description,
+//     });
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "loyalty-admin",
+//       description: `Adjusted ${newPoints} points for user ${userId}`,
+//       meta: { entryId: entry._id },
+//       ipAddress: req.ip,
+//     });
+
+//     res.status(StatusCodes.OK).json({
+//       message: "Points adjusted",
+//       entry,
+//       loyaltyPoints: user.loyaltyPoints,
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// module.exports = { getLoyaltyHistory, awardPoints, redeemPoints, adjustPoints }; .const Order = require("../model/order");
+// const { StatusCodes } = require("http-status-codes");
+// const NotFoundError = require("../errors/notFoundError");
+// const BadRequestError = require("../errors/bad-request-error");
+// const getOrderStatusProgress = require("../utils/orderStatusProgress");
+
+// // GET /api/orders (user) - paginated
+// const getUserOrders = async (req, res) => {
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 10;
+//   const skip = (page - 1) * limit;
+
+//   const orders = await Order.find({ user: req.user.userID })
+//     .skip(skip)
+//     .limit(limit)
+//     .sort({ createdAt: -1 });
+
+//   const sanitizedOrders = orders.map((order) => ({
+//     id: order._id,
+//     items: order.items,
+//     totalAmount: order.totalAmount,
+//     shippingAddress: order.shippingAddress,
+//     status: order.status,
+//     statusProgress: getOrderStatusProgress(order.status), // << add progress
+//     createdAt: order.createdAt,
+//     updatedAt: order.updatedAt,
+//   }));
+
+//   res.status(StatusCodes.OK).json({
+//     count: sanitizedOrders.length,
+//     orders: sanitizedOrders.length
+//       ? sanitizedOrders
+//       : [{ message: "No orders yet" }],
+//   });
+// };
+
+// // GET /api/orders/:id (user)
+// const getOrderById = async (req, res) => {
+//   const order = await Order.findOne({
+//     _id: req.params.id,
+//     user: req.user.userID,
+//   });
+//   if (!order) throw new NotFoundError("Order not found");
+
+//   const sanitizedOrder = {
+//     id: order._id,
+//     items: order.items,
+//     totalAmount: order.totalAmount,
+//     shippingAddress: order.shippingAddress,
+//     status: order.status,
+//     statusProgress: getOrderStatusProgress(order.status), // << add progress
+//     createdAt: order.createdAt,
+//     updatedAt: order.updatedAt,
+//   };
+
+//   res.status(StatusCodes.OK).json({ order: sanitizedOrder });
+// };
+
+// // POST /api/orders (user creates order)
+// const createOrder = async (req, res) => {
+//   const { items, totalAmount, shippingAddress } = req.body;
+//   if (!items || !items.length || !totalAmount)
+//     throw new BadRequestError("Order items and total amount are required");
+
+//   const order = await Order.create({
+//     user: req.user.userID,
+//     items,
+//     totalAmount,
+//     shippingAddress,
+//     status: "pending",
+//   });
+
+//   res.status(StatusCodes.CREATED).json({
+//     message: "Order created",
+//     order: {
+//       id: order._id,
+//       status: order.status,
+//       statusProgress: getOrderStatusProgress(order.status), // << add progress
+//       totalAmount: order.totalAmount,
+//       items: order.items,
+//       shippingAddress: order.shippingAddress,
+//       createdAt: order.createdAt,
+//     },
+//   });
+// };
+
+// module.exports = { getUserOrders, getOrderById, createOrder }; .// controllers/paymentController.js
+// const PaymentService = require("../services/paymentServices");
+// const Cart = require("../model/cart");
+// const Order = require("../model/order");
+// const Payment = require("../model/payment");
+// const BadRequestError = require("../errors/bad-request-error");
+
+// // ------------------ Helper ------------------
+// const calcCartTotal = (items) =>
+//   items.reduce((sum, i) => {
+//     const price = i.product?.price || 0;
+//     const discountedPrice = price * (1 - (i.discount || 0) / 100);
+//     return sum + discountedPrice * i.quantity;
+//   }, 0);
+
+// // ------------------ GET WALLET ------------------
+// exports.getWallet = async (req, res, next) => {
+//   try {
+//     const wallet = await PaymentService.getWallet(req.user._id);
+//     res.status(200).json(wallet);
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // ------------------ INITIALIZE PAYMENT ------------------
+// exports.initializePayment = async (req, res, next) => {
+//   try {
+//     // Load cart
+//     const cart = await Cart.findOne({ user: req.user._id }).populate(
+//       "items.product"
+//     );
+//     if (!cart || cart.items.length === 0)
+//       throw new BadRequestError("Cart is empty");
+
+//     // Compute amount
+//     const totalAmount = req.body.amount || calcCartTotal(cart.items);
+//     if (!totalAmount || totalAmount <= 0)
+//       throw new BadRequestError("Invalid amount");
+
+//     const { email, currency } = req.body;
+//     if (!email) throw new BadRequestError("Email is required");
+
+//     // Idempotency check
+//     const existing = await PaymentService.checkPendingPayment(
+//       req.user._id,
+//       totalAmount
+//     );
+//     if (existing) {
+//       return res.status(409).json({
+//         message: "A payment for this amount is already pending",
+//         reference: existing.reference,
+//       });
+//     }
+
+//     // Create order snapshot
+//     const orderItems = cart.items.map((i) => ({
+//       productId: i.product._id,
+//       name: i.product.name,
+//       quantity: i.quantity,
+//       price: i.product.price,
+//       discount: i.discount || 0,
+//       selectedColor: i.selectedColor,
+//       selectedSize: i.selectedSize,
+//       image: i.product.images?.[0]?.url || "",
+//     }));
+
+//     const order = await Order.create({
+//       user: req.user._id,
+//       items: orderItems,
+//       totalAmount,
+//       paymentStatus: "pending",
+//       orderStatus: "processing",
+//       address: req.body.address || req.user.address || "N/A",
+//       reference: null,
+//     });
+
+//     // Initialize Paystack payment
+//     const init = await PaymentService.initializePayment(
+//       req.user._id,
+//       totalAmount,
+//       email,
+//       currency || "NGN",
+//       { orderId: order._id }
+//     );
+
+//     order.reference = init.reference;
+//     await order.save();
+
+//     // Respond with URL ONLY — NO SENSITIVE FIELDS
+//     res.status(200).json({
+//       message: "Payment initiated",
+//       authorization_url: init.authorization_url,
+//       reference: init.reference,
+//       orderId: order._id,
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // ------------------ VERIFY PAYMENT ------------------
+// exports.verifyPayment = async (req, res, next) => {
+//   try {
+//     const { reference } = req.query;
+//     if (!reference) throw new BadRequestError("Reference is required");
+
+//     const result = await PaymentService.verifyPayment(reference);
+
+//     // Clear cart after successful payment
+//     if (result.success) {
+//       await Cart.findOneAndUpdate({ user: req.user._id }, { items: [] });
+//     }
+
+//     res.status(200).json({
+//       status: result.status,
+//       success: result.success,
+//       amount: result.amount,
+//       currency: result.currency,
+//       message: "Payment verified successfully",
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // ------------------ PAYMENT HISTORY ------------------
+// exports.getPaymentHistory = async (req, res, next) => {
+//   try {
+//     const history = await PaymentService.getPaymentHistory(req.user._id);
+
+//     res.status(200).json({
+//       payments: history.map((p) => ({
+//         _id: p._id,
+//         amount: p.amount,
+//         status: p.status,
+//         reference: p.reference,
+//         createdAt: p.createdAt,
+//       })),
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// }; .const { StatusCodes } = require("http-status-codes");
+// const mongoose = require("mongoose");
+// const RecentlyViewed = require("../model/recentlyViewed");
+// const BadRequestError = require("../errors/bad-request-error");
+// const { logActivity } = require("../utils/activityLogger");
+// const yup = require("yup");
+
+// // -------------------- VALIDATION --------------------
+// const addViewedSchema = yup.object().shape({
+//   productId: yup.string().required("productId is required"),
+// });
+
+// // -------------------- ADD RECENTLY VIEWED --------------------
+// const addRecentlyViewed = async (req, res, next) => {
+//   try {
+//     const { productId } = await addViewedSchema.validate(req.body, {
+//       abortEarly: false,
+//     });
+
+//     if (!mongoose.Types.ObjectId.isValid(productId)) {
+//       throw new BadRequestError("Invalid productId");
+//     }
+
+//     // Upsert: create or update timestamp
+//     await RecentlyViewed.findOneAndUpdate(
+//       { user: req.user.userID, product: productId },
+//       { $set: { updatedAt: new Date() } },
+//       { upsert: true, new: true, setDefaultsOnInsert: true }
+//     );
+
+//     // Enforce max 50 items per user
+//     const count = await RecentlyViewed.countDocuments({
+//       user: req.user.userID,
+//     });
+//     if (count > 50) {
+//       const oldest = await RecentlyViewed.find({ user: req.user.userID })
+//         .sort({ updatedAt: 1 })
+//         .limit(count - 50);
+//       const idsToDelete = oldest.map((doc) => doc._id);
+//       await RecentlyViewed.deleteMany({ _id: { $in: idsToDelete } });
+//     }
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "RECENTLY_VIEWED",
+//       description: "Viewed product",
+//       meta: { productId },
+//       ipAddress: req.ip,
+//     });
+
+//     res.status(StatusCodes.OK).json({ message: "Recent view recorded" });
+//   } catch (err) {
+//     if (err.name === "ValidationError" || err.name === "AggregateError") {
+//       return next(new BadRequestError(err.errors.join(", ")));
+//     }
+//     next(err);
+//   }
+// };
+
+// // -------------------- LIST RECENTLY VIEWED --------------------
+// const listRecentlyViewed = async (req, res, next) => {
+//   try {
+//     let limit = parseInt(req.query.limit) || 10;
+//     limit = Math.min(limit, 50); // enforce max 50
+
+//     const items = await RecentlyViewed.find({ user: req.user.userID })
+//       .populate("product")
+//       .sort({ updatedAt: -1 })
+//       .limit(limit);
+
+//     res.status(StatusCodes.OK).json({
+//       count: items.length,
+//       items,
+//     });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- REMOVE RECENTLY VIEWED --------------------
+// const removeRecentlyViewed = async (req, res, next) => {
+//   try {
+//     const { id } = req.params;
+//     if (!id) throw new BadRequestError("ID required");
+
+//     const deleted =
+//       (await RecentlyViewed.findOneAndDelete({
+//         _id: id,
+//         user: req.user.userID,
+//       })) ||
+//       (await RecentlyViewed.findOneAndDelete({
+//         product: id,
+//         user: req.user.userID,
+//       }));
+
+//     if (!deleted) {
+//       return res
+//         .status(StatusCodes.NOT_FOUND)
+//         .json({ message: "Recently viewed item not found" });
+//     }
+
+//     res
+//       .status(StatusCodes.OK)
+//       .json({ message: "Removed from recently viewed" });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// module.exports = {
+//   addRecentlyViewed,
+//   listRecentlyViewed,
+//   removeRecentlyViewed,
+// }; .const { StatusCodes } = require("http-status-codes");
+// const mongoose = require("mongoose");
+// const SupportTicket = require("../model/supportTicket");
+// const BadRequestError = require("../errors/bad-request-error");
+// const NotFoundError = require("../errors/notFoundError");
+// const { logActivity } = require("../utils/activityLogger");
+// const yup = require("yup");
+
+// // -------------------- CONFIG --------------------
+// const PRIORITY_VALUES = ["low", "medium", "high"];
+// const ALLOWED_FILE_TYPES = ["image/jpeg", "image/png", "application/pdf"];
+// const MAX_FILE_SIZE_MB = 5; // max 5MB per file
+// const MAX_TICKETS_PER_USER = 10; // rate-limiting per user
+
+// // -------------------- VALIDATION --------------------
+// const createTicketSchema = yup.object().shape({
+//   subject: yup.string().required("subject is required"),
+//   message: yup.string().required("message is required"),
+//   priority: yup.string().oneOf(PRIORITY_VALUES).optional(),
+// });
+
+// // -------------------- CREATE TICKET --------------------
+// const createTicket = async (req, res, next) => {
+//   try {
+//     // Rate-limit: max tickets per user
+//     const ticketCount = await SupportTicket.countDocuments({
+//       user: req.user.userID,
+//       deleted: false,
+//     });
+//     if (ticketCount >= MAX_TICKETS_PER_USER) {
+//       return res.status(StatusCodes.TOO_MANY_REQUESTS).json({
+//         message: "Ticket limit reached. Please resolve existing tickets first.",
+//       });
+//     }
+
+//     const { subject, message, priority } = await createTicketSchema.validate(
+//       req.body,
+//       { abortEarly: false }
+//     );
+//     const validatedPriority = priority || "medium";
+
+//     // Validate attachments
+//     const attachedFiles = Array.isArray(req.files)
+//       ? req.files
+//           .filter(
+//             (f) =>
+//               ALLOWED_FILE_TYPES.includes(f.mimetype) &&
+//               f.size <= MAX_FILE_SIZE_MB * 1024 * 1024
+//           )
+//           .map((f) => f.path)
+//       : [];
+
+//     const ticket = await SupportTicket.create({
+//       user: req.user.userID,
+//       subject,
+//       message,
+//       priority: validatedPriority,
+//       attachedFiles,
+//       status: "open",
+//       deleted: false, // soft delete flag
+//     });
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "SUPPORT_TICKET",
+//       description: "Created support ticket",
+//       meta: { ticketId: ticket._id },
+//       ipAddress: req.ip,
+//     });
+
+//     res
+//       .status(StatusCodes.CREATED)
+//       .json({ message: "Support ticket created", ticket });
+//   } catch (err) {
+//     if (err.name === "ValidationError" || err.name === "AggregateError") {
+//       return next(new BadRequestError(err.errors.join(", ")));
+//     }
+//     next(err);
+//   }
+// };
+
+// // -------------------- LIST TICKETS --------------------
+// const listTickets = async (req, res, next) => {
+//   try {
+//     const page = parseInt(req.query.page) || 1;
+//     const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+//     const skip = (page - 1) * limit;
+
+//     const filter = { deleted: false };
+//     if (!req.user.isAdmin) {
+//       filter.user = req.user.userID;
+//     } else {
+//       if (req.query.user) filter.user = req.query.user;
+//       if (req.query.status) filter.status = req.query.status;
+//       if (req.query.priority) filter.priority = req.query.priority;
+//     }
+
+//     const tickets = await SupportTicket.find(filter)
+//       .sort({ createdAt: -1 })
+//       .skip(skip)
+//       .limit(limit)
+//       .lean();
+
+//     const total = await SupportTicket.countDocuments(filter);
+
+//     res
+//       .status(StatusCodes.OK)
+//       .json({ page, limit, total, count: tickets.length, tickets });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- GET SINGLE TICKET --------------------
+// const getTicket = async (req, res, next) => {
+//   try {
+//     const { id } = req.params;
+//     if (!mongoose.Types.ObjectId.isValid(id))
+//       throw new BadRequestError("Invalid ticket ID");
+
+//     const filter = { _id: id, deleted: false };
+//     if (!req.user.isAdmin) filter.user = req.user.userID;
+
+//     const ticket = await SupportTicket.findOne(filter).lean();
+//     if (!ticket) throw new NotFoundError("Ticket not found");
+
+//     res.status(StatusCodes.OK).json({ ticket });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- CLOSE TICKET --------------------
+// const closeTicket = async (req, res, next) => {
+//   try {
+//     const { id } = req.params;
+//     if (!mongoose.Types.ObjectId.isValid(id))
+//       throw new BadRequestError("Invalid ticket ID");
+
+//     const filter = { _id: id, deleted: false };
+//     if (!req.user.isAdmin) filter.user = req.user.userID;
+
+//     const ticket = await SupportTicket.findOne(filter);
+//     if (!ticket) throw new NotFoundError("Ticket not found");
+
+//     if (ticket.status === "closed")
+//       return res
+//         .status(StatusCodes.BAD_REQUEST)
+//         .json({ message: "Ticket already closed" });
+
+//     ticket.status = "closed";
+//     await ticket.save();
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "SUPPORT_TICKET",
+//       description: "Closed support ticket",
+//       meta: { ticketId: ticket._id },
+//       ipAddress: req.ip,
+//     });
+
+//     res.status(StatusCodes.OK).json({ message: "Ticket closed", ticket });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- REOPEN TICKET --------------------
+// const reopenTicket = async (req, res, next) => {
+//   try {
+//     const { id } = req.params;
+//     if (!mongoose.Types.ObjectId.isValid(id))
+//       throw new BadRequestError("Invalid ticket ID");
+
+//     const filter = { _id: id, deleted: false };
+//     if (!req.user.isAdmin) filter.user = req.user.userID;
+
+//     const ticket = await SupportTicket.findOne(filter);
+//     if (!ticket) throw new NotFoundError("Ticket not found");
+
+//     if (ticket.status === "open")
+//       return res
+//         .status(StatusCodes.BAD_REQUEST)
+//         .json({ message: "Ticket already open" });
+
+//     ticket.status = "open";
+//     await ticket.save();
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "SUPPORT_TICKET",
+//       description: "Reopened support ticket",
+//       meta: { ticketId: ticket._id },
+//       ipAddress: req.ip,
+//     });
+
+//     res.status(StatusCodes.OK).json({ message: "Ticket reopened", ticket });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- BULK CLOSE (ADMIN ONLY) --------------------
+// const bulkCloseTickets = async (req, res, next) => {
+//   try {
+//     if (!req.user.isAdmin) throw new BadRequestError("Admin access required");
+//     const { ticketIds } = req.body;
+//     if (!Array.isArray(ticketIds) || ticketIds.length === 0)
+//       throw new BadRequestError("ticketIds array required");
+
+//     const validIds = ticketIds.filter((id) =>
+//       mongoose.Types.ObjectId.isValid(id)
+//     );
+
+//     const result = await SupportTicket.updateMany(
+//       { _id: { $in: validIds }, deleted: false },
+//       { $set: { status: "closed" } }
+//     );
+
+//     res
+//       .status(StatusCodes.OK)
+//       .json({ message: `Closed ${result.modifiedCount} tickets` });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// // -------------------- SOFT DELETE --------------------
+// const deleteTicket = async (req, res, next) => {
+//   try {
+//     const { id } = req.params;
+//     if (!mongoose.Types.ObjectId.isValid(id))
+//       throw new BadRequestError("Invalid ticket ID");
+
+//     const filter = { _id: id, deleted: false };
+//     if (!req.user.isAdmin) filter.user = req.user.userID;
+
+//     const ticket = await SupportTicket.findOne(filter);
+//     if (!ticket) throw new NotFoundError("Ticket not found");
+
+//     ticket.deleted = true;
+//     await ticket.save();
+
+//     await logActivity({
+//       user: req.user.userID,
+//       type: "SUPPORT_TICKET",
+//       description: "Soft deleted ticket",
+//       meta: { ticketId: ticket._id },
+//       ipAddress: req.ip,
+//     });
+
+//     res.status(StatusCodes.OK).json({ message: "Ticket soft deleted" });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
+// module.exports = {
+//   createTicket,
+//   listTickets,
+//   getTicket,
+//   closeTicket,
+//   reopenTicket,
+//   bulkCloseTickets,
+//   deleteTicket,
+// }; .const crypto = require("crypto");
+// const User = require("../model/userModel");
+// const BadRequestError = require("../errors/bad-request-error");
+
+// const resetPassword = async (req, res) => {
+//   const { token, password } = req.body;
+//   if (!token || !password) throw new BadRequestError("All fields are required");
+
+//   const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
+
+//   const user = await User.findOne({
+//     resetPasswordToken: hashedToken,
+//     resetPasswordExpires: { $gt: Date.now() },
+//   });
+
+//   if (!user) throw new BadRequestError("Invalid or expired token");
+
+//   user.password = password; // Mongoose pre-save hook will hash this
+//   user.resetPasswordToken = undefined;
+//   user.resetPasswordExpires = undefined;
+//   await user.save();
+
+//   res.status(200).json({ message: "Password reset successful" });
+// };
+
+// module.exports = resetPassword; .// services/paymentService.js
+// const axios = require("axios");
+// const Payment = require("../model/payment");
+// const User = require("../model/userModel");
+// const Order = require("../model/order");
+// const BadRequestError = require("../errors/bad-request-error");
+// const NotFoundError = require("../errors/notFoundError");
+// const generateReference = require("../utils/generateReference");
+
+// const PAYSTACK_BASE =
+//   process.env.PAYSTACK_BASE_URL || "https://api.paystack.co";
+// const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+
+// if (!PAYSTACK_SECRET) {
+//   console.warn(
+//     "❗ PAYSTACK_SECRET_KEY not set — payment initialization/verification will fail."
+//   );
+// }
+
+// const headers = () => ({
+//   Authorization: `Bearer ${PAYSTACK_SECRET}`,
+//   "Content-Type": "application/json",
+// });
+
+// const PaymentService = {
+//   // =========================================================
+//   // GET WALLET + PAYMENT HISTORY (Your old logic + upgrade)
+//   // =========================================================
+//   getWallet: async (userId) => {
+//     const user = await User.findById(userId);
+//     if (!user) throw new NotFoundError("User not found");
+
+//     const payments = await Payment.find({ user: userId }).sort({
+//       createdAt: -1,
+//     });
+
+//     // Balance will be auto-updated only after successful verification
+//     return {
+//       balance: user.walletBalance || 0,
+//       payments,
+//     };
+//   },
+
+//   // ==================================================================
+//   // IDEMPOTENCY CHECK (New upgrade)
+//   // Prevent user from initializing same payment twice accidentally
+//   // ==================================================================
+//   checkPendingPayment: async (userId, amount) => {
+//     return Payment.findOne({
+//       user: userId,
+//       amount,
+//       status: "pending",
+//     });
+//   },
+
+//   // =========================================================
+//   // INITIALIZE PAYMENT (Fully merged old + upgraded)
+//   // =========================================================
+//   initializePayment: async (
+//     userId,
+//     amount,
+//     email,
+//     currency = "NGN",
+//     metadata = {}
+//   ) => {
+//     if (!amount || amount <= 0) throw new BadRequestError("Invalid amount");
+
+//     if (!email) throw new BadRequestError("Email is required");
+
+//     // Idempotency check
+//     const existing = await PaymentService.checkPendingPayment(userId, amount);
+//     if (existing) {
+//       return {
+//         reference: existing.reference,
+//         authorization_url: existing.metadata?.authorization_url,
+//         message: "Pending payment already exists",
+//       };
+//     }
+
+//     // Unique reference (upgrade)
+//     const reference = generateReference("pay");
+
+//     // Create local pending payment (upgrade)
+//     const payment = await Payment.create({
+//       user: userId,
+//       reference,
+//       amount,
+//       currency,
+//       status: "pending",
+//       metadata: { initiatingEmail: email, ...metadata },
+//     });
+
+//     // Paystack expects amount in KOBO if NGN
+//     const payload = {
+//       email,
+//       amount: currency === "NGN" ? amount * 100 : amount,
+//       currency,
+//       reference,
+//       metadata,
+//     };
+
+//     // Call Paystack
+//     const resp = await axios.post(
+//       `${PAYSTACK_BASE}/transaction/initialize`,
+//       payload,
+//       { headers: headers() }
+//     );
+
+//     const data = resp.data?.data;
+
+//     if (!data?.reference)
+//       throw new BadRequestError("Failed to initialize payment");
+
+//     // Save metadata from paystack response
+//     payment.metadata = { ...payment.metadata, ...data };
+//     await payment.save();
+
+//     return {
+//       reference: data.reference,
+//       authorization_url: data.authorization_url,
+//       access_code: data.access_code,
+//       message: "Payment initialized",
+//     };
+//   },
+
+//   // =========================================================
+//   // VERIFY PAYMENT (Merged old + upgraded + wallet + order)
+//   // =========================================================
+//   verifyPayment: async (reference) => {
+//     if (!reference) throw new BadRequestError("Payment reference is required");
+
+//     const payment = await Payment.findOne({ reference });
+//     if (!payment) throw new NotFoundError("Payment not found");
+
+//     // Verify from Paystack
+//     const resp = await axios.get(
+//       `${PAYSTACK_BASE}/transaction/verify/${reference}`,
+//       { headers: headers() }
+//     );
+
+//     const data = resp.data?.data;
+//     if (!data) throw new BadRequestError("Invalid verification response");
+
+//     const isSuccess = data.status === "success";
+
+//     // Update local payment
+//     payment.status = isSuccess ? "success" : "failed";
+//     payment.channel = data.channel;
+//     payment.metadata = { ...payment.metadata, paystack: data };
+//     await payment.save();
+
+//     let updatedWallet = null;
+
+//     // =========================================================
+//     // If success → update wallet (from your old logic)
+//     // =========================================================
+//     if (isSuccess) {
+//       const user = await User.findById(payment.user);
+//       if (!user) throw new NotFoundError("User not found");
+
+//       user.walletBalance = (user.walletBalance || 0) + payment.amount;
+//       await user.save();
+//       updatedWallet = { balance: user.walletBalance };
+
+//       // =========================================================
+//       // If there's an associated order → mark paid (upgrade)
+//       // =========================================================
+//       await Order.findOneAndUpdate(
+//         { reference },
+//         {
+//           paymentStatus: "paid",
+//           orderStatus: "processing",
+//         }
+//       );
+//     }
+
+//     return {
+//       message: isSuccess ? "Payment verified successfully" : "Payment failed",
+//       updatedWallet,
+//       data,
+//     };
+//   },
+
+//   // =========================================================
+//   // GET PAYMENT HISTORY ONLY (same as old)
+//   // =========================================================
+//   getPaymentHistory: async (userId) => {
+//     return await Payment.find({ user: userId }).sort({ createdAt: -1 });
+//   },
+// };
+
+// module.exports = PaymentService; .const User = require("../model/userModel");
+// const generateResetToken = require("../utils/generateResetToken");
+// const sendEmail = require("../utils/sendEmail");
+// const BadRequestError = require("../errors/bad-request-error");
+
+// const forgotPassword = async (req, res) => {
+//   const { email } = req.body;
+//   if (!email) throw new BadRequestError("Email is required");
+
+//   const user = await User.findOne({ email });
+//   if (!user) throw new BadRequestError("User not found");
+
+//   const { token, hashedToken, expires } = generateResetToken();
+
+//   user.resetPasswordToken = hashedToken;
+//   user.resetPasswordExpires = expires;
+//   await user.save();
+
+//   const resetURL = `${process.env.CLIENT_URL}/reset-password?token=${token}`;
+
+//   await sendEmail({
+//     to: user.email,
+//     subject: "Reset Your Password",
+//     text: `Click this link to reset your password: ${resetLink}`,
+//     htmlTemplatePath: "emails/reset-password-email.html",
+//     placeholders: {
+//       RESET_LINK: resetLink,
+//       EMAIL: user.email,
+//       COMPANY: "Your Company Name",
+//       YEAR: new Date().getFullYear(),
+//     },
+//   });
+
+//   res.status(200).json({ message: "Password reset link sent to email" });
+// };
+
+// module.exports = forgotPassword; make sue all functionalities are used in my user dashboard and also add suggested functionalities and tell me where and what to add to my backend code to make it work. give me back all functionalities dont ommit any. from the code i sent u some functionalities are for admin alone so separate dem or skip does . this are my user roustes router.get("/", listActivities);,router.get("/", listAddresses);
+// router.get("/:id", getAddress);
+// router.post("/", createAddress);
+// router.put("/:id", updateAddress);
+// router.delete("/:id", deleteAddress);,router.post("/register", registerSchema, register);
+// router.post("/login", loginSchema, login);
+// router.post("/verify-email/:token", verifyUser);
+// router.post("/resend-otp/:token", resendOtp);
+// router.post("/forgot-password", forgotPassword);
+// router.post("/reset-password", resetPassword);
+// router.delete("/delete", authenticate, deleteAccount);
+// router.post("/logout", authenticate, logout);,router.get("/", getCart);
+// router.post("/add", addToCart);router.get("/", authenticate, getUserDashboard);
+
+// // PUT update profile
+// router.put("/update-profile", authenticate, updateProfile);
+
+// // POST download receipt
+// router.get("/receipt/:orderId", authenticate, downloadReceipt);
+
+// // GET user payments
+// router.get("/payments", authenticate, getUserPayments);
+
+// // PATCH change password
+// router.patch("/change-password", authenticate, changePassword);, router.get("/history", getLoyaltyHistory);
+// router.post("/award", awardPoints);
+// router.post("/redeem", redeemPoints);,router.put("/:productId", updateCartItem);
+// router.delete("/:productId", removeCartItem);
+// router.post("/sync", syncCart);router.get("/", getNotifications);
+// router.patch("/:id/read", markAsRead);
+// router.patch("/read-all", markAllRead);,router.post("/", createOrder);
+// router.get("/", getUserOrders);
+// router.get("/:id", getOrderById);,router.post("/", addPaymentMethod);
+// router.get("/", getPaymentMethods);
+// router.put("/:id", updatePaymentMethod);
+// router.delete("/:id", deletePaymentMethod);,router.get("/wallet", getWallet);
+// router.post("/initiate", initializePayment);
+// router.get("/verify", verifyPayment);
+// router.get("/history", getPaymentHistory);,router.get("/", getProducts);
+// router.get("/random", getRandomProducts);
+// router.get("/:id", getProductById);,router.post(
+//   "/avatar",
+//   authenticate,
+//   uploadAvatar.single("avatar"),
+//   uploadProfilePic
+// );,router.post("/", addRecentlyViewed);
+// router.get("/", listRecentlyViewed);
+// router.delete("/:id", removeRecentlyViewed);,router.get("/", getSessions);
+// router.delete("/:id", revokeSession);,router.post("/", createTicket);
+// router.get("/", listTickets);
+// router.get("/:id", getTicket);
+// router.put("/:id/close", closeTicket);
+// router.put("/:id/reopen", reopenTicket);
+// router.delete("/:id", deleteTicket);
+// router.delete("/", revokeAllSessions);,router.post(
+//   "/user/avatar",
+//   authenticate,
+//   uploadLimiter,
+//   uploadValidator.avatarUpload,
+//   uploadController.uploadAvatar,
+//   cloudinaryErrorHandler
+// );router.get("/", getWishlist);
+// router.post("/", addToWishlist);
+// router.delete("/:productId", removeFromWishlist);. router.use("/auth", authRoutes);
+// router.use("/dashboard", dashboardRoutes);
+// router.use("/orders", orderRoutes);
+// router.use("/profile", profileRoutes);
+// router.use("/products", productRoutes);
+// router.use("/wishlist", wishlistRoutes);
+// router.use("/notifications", notificationRoutes);
+// router.use("/sessions", sessionRoutes);
+// router.use("/payment", paymentRoutes);
+// router.use("/cart", cartRoutes);
+// router.use("/addresses", authenticate, userAddresses);
+// router.use("/loyalty", authenticate, userLoyalty);
+// router.use("/recently-viewed", authenticate, userRecentlyViewed);
+// router.use("/support-tickets", authenticate, userSupportTickets);
+// router.use("/activity-logs", authenticate, userActivityLogs);.
+// // // src/redux/slices/dashboardSlice.js
+// // import {
+// //   createSlice,
+// //   createAsyncThunk,
+// //   createSelector,
+// // } from "@reduxjs/toolkit";
+// // import api from "../../utils/api";
+
+// // export const fetchDashboard = createAsyncThunk(
+// //   "dashboard/fetchDashboard",
+// //   async (_, { rejectWithValue }) => {
+// //     try {
+// //       const res = await api.get("/dashboard/full", {
+// //         withCredentials: true,
+// //       });
+// //       return res.data || {};
+// //     } catch (err) {
+// //       return rejectWithValue(err.response?.data || "Failed to fetch dashboard");
+// //     }
+// //   }
+// // );
+
+// // const initialState = {
+// //   summary: {}, // FIXED (was null)
+// //   wishlist: [],
+// //   orders: [],
+// //   notifications: [],
+// //   sessions: [],
+
+// //   salesInsights: [],
+// //   topProducts: [],
+// //   categoryBreakdown: [],
+// //   traffic: [],
+// //   refunds: [],
+
+// //   loading: false,
+// //   error: null,
+// //   lastFetched: null,
+// // };
+
+// // const dashboardSlice = createSlice({
+// //   name: "dashboard",
+// //   initialState,
+// //   reducers: {
+// //     clearDashboardData: () => initialState,
+// //   },
+
+// //   extraReducers: (builder) => {
+// //     builder
+// //       .addCase(fetchDashboard.pending, (state) => {
+// //         state.loading = true;
+// //         state.error = null;
+// //       })
+
+// //       .addCase(fetchDashboard.fulfilled, (state, action) => {
+// //         state.loading = false;
+// //         const d = action.payload || {};
+
+// //         state.summary = d.summary || {};
+// //         state.wishlist = d.wishlist || [];
+// //         state.orders = d.orders || [];
+// //         state.notifications = d.notifications || [];
+// //         state.sessions = d.sessions || [];
+
+// //         state.salesInsights = d.salesInsights || [];
+// //         state.topProducts = d.topProducts || [];
+// //         state.categoryBreakdown = d.categoryBreakdown || [];
+// //         state.traffic = d.traffic || [];
+// //         state.refunds = d.refunds || [];
+
+// //         state.lastFetched = Date.now();
+// //       })
+
+// //       .addCase(fetchDashboard.rejected, (state, action) => {
+// //         state.loading = false;
+// //         state.error = action.payload || "Failed to fetch dashboard";
+// //       });
+// //   },
+// // });
+
+// // export const { clearDashboardData } = dashboardSlice.actions;
+// // export default dashboardSlice.reducer;
+
+// // export const selectDashboard = (state) => state.dashboard;
+
+// // export const selectSummary = createSelector(
+// //   [selectDashboard],
+// //   (d) => d.summary
+// // );
+
+// // export const selectRecentOrders = createSelector(
+// //   [selectDashboard],
+// //   (d) => d.orders?.slice(0, 5) || []
+// // );
+
+// // export const selectBestSellers = createSelector(
+// //   [selectDashboard],
+// //   (d) => d.topProducts?.slice(0, 8) || []
+// // );
+
+// // export const selectSalesTrend = createSelector(
+// //   [selectDashboard],
+// //   (d) => d.salesInsights || []
+// // );
+
+// // export const selectCategoryChart = createSelector(
+// //   [selectDashboard],
+// //   (d) => d.categoryBreakdown || []
+// // );
+
+// // export const selectTrafficAnalytics = createSelector(
+// //   [selectDashboard],
+// //   (d) => d.traffic || []
+// // );
+
+// // export const selectRefundStats = createSelector(
+// //   [selectDashboard],
+// //   (d) => d.refunds || []
+// // );

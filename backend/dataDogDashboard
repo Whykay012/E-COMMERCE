@@ -1,0 +1,57 @@
+{
+  "title": "Zenith Omega: Auth & Worker Health",
+  "description": "Monitoring Risk-Based Auth, Adaptive MFA, and Outbox Reliability",
+  "widgets": [
+    {
+      "definition": {
+        "title": "Login Success vs Failures (Real-time)",
+        "type": "timeseries",
+        "requests": [
+          { "q": "sum:auth.login.success{*}.as_count()", "display_type": "line" },
+          { "q": "sum:auth.login.fail{*}.as_count()", "display_type": "line" }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "MFA Challenge Distribution (Zenith vs Absolute)",
+        "type": "toplist",
+        "requests": [
+          { "q": "top(sum:security.mfa.initiated{*} by {mode}.as_count(), 10, 'sum', 'desc')" }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "MFA Success Rate %",
+        "type": "query_value",
+        "autoscale": true,
+        "precision": 2,
+        "requests": [
+          { "q": "(sum:security.mfa.success{*}.as_count() / sum:security.mfa.initiated{*}.as_count()) * 100" }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Worker Latency: Outbox to Dispatch",
+        "type": "timeseries",
+        "requests": [
+          { "q": "avg:auth.mfa.transaction_duration{*}, avg:worker.auth.logout_latency{*}", "display_type": "area" }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Outbox Self-Healing (Poller Recoveries)",
+        "type": "query_value",
+        "requests": [
+          { "q": "sum:security.mfa.dispatch_retried_later{*}.as_count()" }
+        ]
+      }
+    }
+  ],
+  "template_variables": [
+    { "name": "env", "prefix": "env", "default": "production" }
+  ]
+}

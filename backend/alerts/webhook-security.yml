@@ -1,0 +1,19 @@
+groups:
+- name: webhook-security
+  rules:
+
+  - alert: WebhookReplaySpike
+    expr: rate(webhook_replay_total[5m]) > 20
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High webhook replay rate detected"
+
+  - alert: WebhookReplayBan
+    expr: increase(webhook_replay_ban_total[10m]) > 5
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Webhook replay bans escalating"

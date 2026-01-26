@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Resend OTP</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        background-color: #f4f4f4;
+        padding: 20px;
+      }
+      .container {
+        background-color: white;
+        padding: 30px;
+        border-radius: 8px;
+        max-width: 500px;
+        margin: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h2>{{COMPANY}} - Your New OTP Code</h2>
+      <p>Hello {{EMAIL}},</p>
+      <p>Your OTP is: <strong>{{OTP}}</strong></p>
+      <p>
+        This code will expire in 10 minutes. Please do not share it with anyone.
+      </p>
+      <p>&copy; {{YEAR}} {{COMPANY}}. All rights reserved.</p>
+    </div>
+  </body>
+</html>

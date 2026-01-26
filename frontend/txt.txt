@@ -1,0 +1,818 @@
+import React, { useState, useEffect, useCallback, createContext, useContext } from 'react';
+import { 
+  User, History, MapPin, CreditCard, Lock, Bell, LogOut, ChevronRight, Menu, Loader2, Save, X, Trash2, Star, Gift, Monitor, Zap, Copy, Map, Plus 
+} from 'lucide-react';
+
+// ====================================================================
+// A. Mocked RTK Query Structure (To satisfy single-file mandate)
+// ====================================================================
+
+// --- 1. Mock Data ---
+const MOCK_PROFILE = {
+    firstName: 'Elara', lastName: 'Vance', email: 'elara.vance@example.com', phone: '555-123-4567',
+    avatarUrl: 'https://placehold.co/100x100/A78BFA/ffffff?text=EV', twoFactorEnabled: true
+};
+const MOCK_ORDERS = [
+    { id: 'ORD-98234', date: '2025-10-01', total: 145.99, status: 'Delivered' },
+    { id: 'ORD-76511', date: '2025-11-15', total: 55.00, status: 'Shipped' },
+    { id: 'ORD-60098', date: '2025-11-25', total: 320.50, status: 'Processing' },
+];
+const MOCK_REVIEWS = [
+    { id: 'REV-101', productName: 'Quantum Mug', date: '2025-08-10', rating: 5, text: "Best coffee delivery system in the galaxy! Highly recommend for morning commutes." },
+    { id: 'REV-102', productName: 'Gravity Stabilizer', date: '2025-09-05', rating: 4, text: "A bit bulky, but keeps the dining table level during turbulence." },
+];
+const MOCK_REFERRAL = {
+    code: 'ELARA-VANCE-99', referralsCount: 3, totalEarned: 1500,
+    history: [
+        { date: '2025-07-20', user: 'Zoe K.', points: 500 },
+        { date: '2025-08-01', user: 'Cai H.', points: 500 },
+        { date: '2025-10-18', user: 'Jax R.', points: 500 },
+    ]
+};
+const MOCK_LOYALTY = { points: 1500 };
+const MOCK_SESSIONS = [
+    { id: 'S-1', device: 'Chrome on Mac OS', location: 'London, UK', lastActive: '2 minutes ago', current: true },
+    { id: 'S-2', device: 'Safari on iPhone', location: 'Tokyo, JP', lastActive: '1 day ago', current: false },
+];
+const MOCK_ADDRESSES = [
+    { id: 'A-1', type: 'Home', line1: '45 Aurora Lane, Apt 2B', city: 'Neo-Terra', country: 'Mars', isDefault: true },
+    { id: 'A-2', type: 'Work', line1: '7 Zenith Tower, Floor 8', city: 'Neo-Terra', country: 'Mars', isDefault: false },
+];
+const MOCK_PAYMENTS = [
+    { id: 'P-1', type: 'Visa', last4: '4242', expiry: '12/28', isDefault: true },
+    { id: 'P-2', type: 'Amex', last4: '1001', expiry: '06/26', isDefault: false },
+];
+const MOCK_NOTIFICATIONS = {
+    email: { restock: true, promo: false, updates: true },
+    inApp: { messages: true, priceDrop: true },
+};
+
+// Safe initial state for notification preferences (for the local state hook)
+const NOTIFICATION_INITIAL_STATE = {
+    email: { restock: false, promo: false, updates: false },
+    inApp: { messages: false, priceDrop: false },
+};
+
+
+// --- 2. Mock Hook Generator ---
+const useMockQuery = (mockData) => {
+    const [data, setData] = useState(undefined);
+    const [isLoading, setIsLoading] = useState(true);
+    const [isError, setIsError] = useState(false);
+
+    useEffect(() => {
+        setIsLoading(true);
+        setIsError(false);
+        const timer = setTimeout(() => {
+            if (Math.random() > 0.95) { 
+                setIsError(true);
+                setData(undefined);
+            } else {
+                setData(mockData);
+            }
+            setIsLoading(false);
+        }, 500);
+
+        return () => clearTimeout(timer);
+    }, [mockData]);
+
+    return { data, isLoading, isError };
+};
+
+// --- 3. Mock Mutation Generator ---
+const useMockMutation = (onSuccessCallback) => {
+    const [isLoading, setIsLoading] = useState(false);
+    
+    const trigger = useCallback(async (payload) => {
+        setIsLoading(true);
+        await new Promise(resolve => setTimeout(resolve, 800));
+        
+        if (onSuccessCallback) {
+            onSuccessCallback(payload);
+        }
+        setIsLoading(false);
+        return { data: { success: true, payload } };
+    }, [onSuccessCallback]);
+
+    return [trigger, { isLoading }];
+};
+
+// --- 4. Mocking the API Hooks using the generators ---
+const useGetProfileQuery = () => useMockQuery(MOCK_PROFILE);
+const useGetOrdersQuery = () => useMockQuery(MOCK_ORDERS);
+const useGetUserReviewsQuery = () => useMockQuery(MOCK_REVIEWS);
+const useGetReferralCodeQuery = () => useMockQuery(MOCK_REFERRAL);
+const useGetLoyaltyHistoryQuery = () => useMockQuery(MOCK_LOYALTY);
+const useGetSessionsQuery = () => useMockQuery(MOCK_SESSIONS);
+const useGetAddressesQuery = () => useMockQuery(MOCK_ADDRESSES);
+const useGetPaymentMethodsQuery = () => useMockQuery(MOCK_PAYMENTS);
+const useGetNotificationPreferencesQuery = () => useMockQuery(MOCK_NOTIFICATIONS);
+
+const useUpdateProfileMutation = () => useMockMutation();
+const useRevokeSessionMutation = () => useMockMutation();
+const useDeleteUserReviewMutation = () => useMockMutation();
+
+
+// ====================================================================
+// B. Shared UI Components (Helper Functions)
+// ====================================================================
+
+const LoadingSpinner = ({ message }) => (
+    <div className="flex flex-col items-center justify-center p-12 text-gray-500">
+        <Loader2 className="w-10 h-10 animate-spin text-indigo-500" />
+        <p className="mt-4 text-xl font-medium">{message}</p>
+    </div>
+);
+
+const ErrorMessage = ({ message }) => (<Message variant="error" message={message} />);
+
+const Message = ({ variant, message }) => {
+    let classes = "";
+    let icon = null;
+
+    if (variant === 'error') {
+        classes = "bg-red-100 border-red-400 text-red-700 dark:bg-red-900/20 dark:border-red-700 dark:text-red-300";
+        icon = <X className="w-5 h-5" />;
+    } else if (variant === 'success') {
+        classes = "bg-green-100 border-green-400 text-green-700 dark:bg-green-900/20 dark:border-green-700 dark:text-green-300";
+        icon = <Save className="w-5 h-5" />;
+    } else {
+         classes = "bg-blue-100 border-blue-400 text-blue-700 dark:bg-blue-900/20 dark:border-blue-700 dark:text-blue-300";
+         icon = <Zap className="w-5 h-5" />;
+    }
+
+    return (
+        <div className={`p-4 border-l-4 rounded-xl shadow-md flex items-center space-x-3 transition-all duration-300 ${classes}`}>
+            {icon}
+            <p className="font-medium">{message}</p>
+        </div>
+    );
+};
+
+const Button = ({ children, onClick, type = 'button', variant = 'primary', icon: Icon, iconSpin = false, disabled = false, size = 'md' }) => {
+    let baseClasses = 'flex items-center justify-center space-x-2 font-semibold rounded-xl shadow-lg transition duration-300 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed transform active:scale-95';
+    
+    if (variant === 'primary') {
+        baseClasses += ' bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-xl hover:scale-[1.01]';
+    } else if (variant === 'secondary') {
+        baseClasses += ' bg-gray-200 text-gray-800 hover:bg-gray-300 dark:bg-gray-700 dark:text-white dark:hover:bg-gray-600 hover:shadow-md';
+    } else if (variant === 'destructive') {
+         baseClasses += ' bg-red-600 text-white hover:bg-red-700 hover:shadow-xl hover:scale-[1.01]';
+    }
+
+    if (size === 'md') {
+        baseClasses += ' px-5 py-2.5 text-lg';
+    } else if (size === 'sm') {
+        baseClasses += ' px-4 py-2 text-sm';
+    }
+
+    return (
+        <button 
+            type={type} 
+            onClick={onClick} 
+            className={baseClasses}
+            disabled={disabled}
+        >
+            {Icon && <Icon className={`w-5 h-5 ${iconSpin ? 'animate-spin' : ''}`} />}
+            <span>{children}</span>
+        </button>
+    );
+};
+
+const StatCard = ({ icon: Icon, title, value, unit, color }) => (
+    <div className="p-6 bg-white rounded-2xl shadow-lg flex items-center space-x-4 border border-gray-100 transition duration-300 transform hover:scale-[1.02] hover:shadow-xl cursor-default">
+        <div className={`p-4 rounded-full bg-indigo-100 ${color} shadow-md`}>
+            <Icon className="w-7 h-7 text-indigo-600" />
+        </div>
+        <div>
+            <p className="text-sm font-medium text-gray-500">{title}</p>
+            <p className="text-3xl font-bold text-gray-900">
+                {value} <span className="text-base font-normal text-gray-500">{unit}</span>
+            </p>
+        </div>
+    </div>
+);
+
+const InputField = ({ label, name, value, onChange, disabled, type = 'text' }) => (
+    <div className="group">
+        <label htmlFor={name} className="block text-sm font-medium text-gray-700 mb-1">
+            {label}
+        </label>
+        <input
+            type={type}
+            id={name}
+            name={name}
+            value={value}
+            onChange={onChange}
+            disabled={disabled}
+            className={`w-full px-4 py-2.5 border rounded-xl shadow-inner focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-200
+            ${disabled 
+                ? 'bg-gray-50 border-gray-200 text-gray-500 cursor-not-allowed' 
+                : 'bg-white border-gray-300 text-gray-900 hover:border-indigo-400'
+            }`}
+        />
+    </div>
+);
+
+// ====================================================================
+// C. Content Components
+// ====================================================================
+
+// --- PROFILE Component ---
+const Profile = () => {
+    const { data: profile, isLoading, isError } = useGetProfileQuery();
+    const [updateProfile, { isLoading: isUpdating }] = useUpdateProfileMutation();
+    
+    const [formData, setFormData] = useState({ firstName: '', lastName: '', email: '', phone: '' });
+    const [isEditing, setIsEditing] = useState(false);
+    const [isSaved, setIsSaved] = useState(false);
+    
+    useEffect(() => {
+        if (profile) {
+            setFormData(profile);
+        }
+    }, [profile]);
+
+    const handleChange = (e) => {
+        setFormData({ ...formData, [e.target.name]: e.target.value });
+        setIsSaved(false); 
+    };
+
+    const handleSave = async (e) => {
+        e.preventDefault();
+        setIsSaved(false);
+        try {
+            await updateProfile(formData); 
+            setIsEditing(false);
+            setIsSaved(true);
+        } catch (err) {
+            console.error('Failed to save profile:', err);
+        }
+    };
+
+    if (isLoading) return <LoadingSpinner message="Loading profile data..." />;
+    if (isError) return <ErrorMessage message="Failed to load profile. Please try again." />;
+    if (!profile) return <ErrorMessage message="No profile data found." />;
+
+    return (
+        <form onSubmit={handleSave} className="space-y-8">
+            <h3 className="text-3xl font-extrabold text-gray-900 mb-6 border-b pb-3 border-gray-100">Personal Information</h3>
+            
+            <div className="flex items-center space-x-6 pb-4">
+                <img src={profile.avatarUrl} alt="User Avatar" className="w-24 h-24 rounded-full object-cover shadow-xl border-4 border-white ring-4 ring-indigo-200"/>
+                <div>
+                    <h4 className="text-2xl font-bold text-gray-800">{profile.firstName} {profile.lastName}</h4>
+                    <span className="text-sm text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full">User ID: {Math.random().toString(36).substring(2, 9)}</span>
+                </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <InputField label="First Name" name="firstName" value={formData.firstName} onChange={handleChange} disabled={!isEditing}/>
+                <InputField label="Last Name" name="lastName" value={formData.lastName} onChange={handleChange} disabled={!isEditing}/>
+                <InputField label="Email" name="email" value={formData.email} onChange={handleChange} disabled={!isEditing} type="email"/>
+                <InputField label="Phone Number" name="phone" value={formData.phone} onChange={handleChange} disabled={!isEditing} type="tel"/>
+            </div>
+
+            <div className="flex justify-end space-x-4 pt-4">
+                {isEditing ? (
+                    <>
+                        <Button type="button" onClick={() => { setIsEditing(false); setFormData(profile); setIsSaved(false); }} variant="secondary" icon={X} disabled={isUpdating} size="sm">
+                            Cancel
+                        </Button>
+                        <Button type="submit" disabled={isUpdating} icon={isUpdating ? Loader2 : Save} iconSpin={isUpdating} size="sm">
+                            {isUpdating ? 'Saving...' : 'Save Changes'}
+                        </Button>
+                    </>
+                ) : (
+                    <Button type="button" onClick={() => setIsEditing(true)} variant="primary" size="sm">
+                        Edit Profile
+                    </Button>
+                )}
+            </div>
+
+            {isSaved && <Message variant="success" message="Profile updated successfully!" />}
+        </form>
+    );
+};
+
+// --- ORDER HISTORY Component (Simplified) ---
+const OrderHistory = () => {
+    const { data: orders, isLoading, isError } = useGetOrdersQuery();
+
+    if (isLoading) return <LoadingSpinner message="Loading order history..." />;
+    if (isError) return <ErrorMessage message="Could not fetch order history." />;
+    if (!orders || orders.length === 0) return <Message message="You have no orders yet." />;
+    
+    const OrderStatus = ({ status }) => {
+        let classes = '';
+        if (status === 'Delivered') classes = 'bg-green-100 text-green-800';
+        else if (status === 'Shipped') classes = 'bg-yellow-100 text-yellow-800';
+        else if (status === 'Processing') classes = 'bg-indigo-100 text-indigo-800';
+        else classes = 'bg-gray-100 text-gray-800';
+        
+        return (
+            <span className={`px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${classes}`}>
+                {status}
+            </span>
+        );
+    };
+
+    return (
+        <div className="space-y-6">
+            <h3 className="text-3xl font-extrabold text-gray-900 border-b pb-3 border-gray-100">Order History ({orders.length})</h3>
+            <div className="overflow-x-auto border border-gray-200 rounded-2xl shadow-xl">
+                <table className="min-w-full divide-y divide-gray-200">
+                    <thead className="bg-gray-50">
+                        <tr>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Order ID</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                        {orders.map((order) => (
+                            <tr key={order.id} className="hover:bg-indigo-50 transition duration-150">
+                                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-indigo-600">{order.id}</td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{order.date}</td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-gray-900">${order.total.toFixed(2)}</td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm"><OrderStatus status={order.status} /></td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    );
+};
+
+// --- MY REVIEWS Component ---
+const MyReviews = () => {
+    const { data: reviews, isLoading, isError } = useGetUserReviewsQuery();
+    const [deleteReview, { isLoading: isDeleting }] = useDeleteUserReviewMutation();
+    
+    const [displayedReviews, setDisplayedReviews] = useState(MOCK_REVIEWS);
+
+    useEffect(() => {
+        if (reviews) {
+            setDisplayedReviews(reviews);
+        }
+    }, [reviews]);
+    
+    const handleDelete = async (reviewId) => {
+        try {
+            await deleteReview(reviewId);
+            setDisplayedReviews(prev => prev.filter(r => r.id !== reviewId));
+        } catch (err) {
+            console.error("Failed to delete review:", err);
+        }
+    };
+    
+    if (isLoading) return <LoadingSpinner message="Loading your product reviews..." />;
+    if (isError) return <ErrorMessage message="Failed to load reviews." />;
+    if (!displayedReviews || displayedReviews.length === 0) return <Message variant="info" message="You haven't submitted any product reviews yet." />;
+
+    return (
+        <div className="space-y-6">
+            <h3 className="text-3xl font-extrabold text-gray-900 border-b pb-3 border-gray-100">My Submitted Reviews ({displayedReviews.length})</h3>
+            
+            <div className="divide-y divide-gray-200 rounded-2xl p-6 shadow-xl bg-white">
+                {displayedReviews.map(review => (
+                    <div key={review.id} className="py-4 flex flex-col sm:flex-row justify-between sm:items-center transition duration-300 hover:bg-gray-50 rounded-xl px-2 -mx-2">
+                        <div className="space-y-1 max-w-xl">
+                            <p className="text-sm text-gray-500">{review.date}</p>
+                            <p className="text-lg font-semibold text-indigo-600">{review.productName}</p>
+                            <div className="flex items-center text-yellow-500 text-base font-bold">
+                                {'★'.repeat(review.rating) + '☆'.repeat(5 - review.rating)} 
+                                <span className="ml-2 text-sm text-gray-500">({review.rating}.0)</span>
+                            </div>
+                            <p className="text-gray-700 italic mt-2 text-base">"{review.text}"</p>
+                        </div>
+                        <div className="mt-3 sm:mt-0 flex space-x-2">
+                            <Button size="sm" variant="secondary" onClick={() => alert(`Editing Review ${review.id}`)}>Edit</Button>
+                            <Button 
+                                size="sm" 
+                                variant="destructive" 
+                                icon={Trash2}
+                                onClick={() => handleDelete(review.id)}
+                                disabled={isDeleting}
+                            >
+                                {isDeleting ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Delete'}
+                            </Button>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+// --- REFERRAL PROGRAM Component ---
+const ReferralProgram = () => {
+    const { data: referral, isLoading: isLoadingReferral, isError: isErrorReferral } = useGetReferralCodeQuery();
+    const { data: loyalty, isLoading: isLoadingLoyalty, isError: isErrorLoyalty } = useGetLoyaltyHistoryQuery();
+    
+    const [copyMessage, setCopyMessage] = useState('');
+
+    const handleCopy = () => {
+        const code = referral?.code || 'LOADING';
+        const textArea = document.createElement("textarea");
+        textArea.value = code;
+        document.body.appendChild(textArea);
+        textArea.select();
+        try {
+            document.execCommand('copy'); 
+            setCopyMessage('Copied!');
+        } catch (err) {
+            setCopyMessage('Copy failed.');
+        }
+        document.body.removeChild(textArea);
+        setTimeout(() => setCopyMessage(''), 2000);
+    };
+
+    if (isLoadingReferral || isLoadingLoyalty) return <LoadingSpinner message="Loading referral program details..." />;
+    if (isErrorReferral || isErrorLoyalty) return <ErrorMessage message="Failed to load referral data." />;
+    if (!referral) return <Message variant="error" message="Referral service is currently unavailable." />;
+
+    return (
+        <div className="space-y-8">
+            <h3 className="text-3xl font-extrabold text-gray-900 border-b pb-3 border-gray-100">Referral & Loyalty Program</h3>
+            
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <StatCard icon={Zap} title="Your Loyalty Points" value={loyalty?.points || 0} unit="points" color="text-indigo-600" />
+                <StatCard icon={User} title="Successful Referrals" value={referral.referralsCount} unit="people" color="text-green-600" />
+                <StatCard icon={Gift} title="Points Earned from Referrals" value={referral.totalEarned} unit="points" color="text-yellow-600" />
+            </div>
+
+            {/* Referral Code Box */}
+            <div className="p-6 border border-indigo-300 rounded-2xl bg-indigo-50 shadow-xl">
+                <p className="text-xl font-medium text-indigo-700 mb-4">Your Unique Referral Code</p>
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center space-y-3 sm:space-y-0 sm:space-x-3">
+                    <div className="flex-grow bg-white p-4 rounded-xl border border-dashed border-indigo-400 font-mono text-xl text-indigo-700 select-all shadow-inner">
+                        {referral.code}
+                    </div>
+                    <Button icon={Copy} onClick={handleCopy} variant="primary" size="sm">
+                        {copyMessage || 'Copy Code'}
+                    </Button>
+                </div>
+                <p className="mt-4 text-sm text-gray-600">
+                    Share this code with friends! They get 10% off, and you earn 500 loyalty points per referral.
+                </p>
+            </div>
+
+            {/* History Table */}
+            <div className="space-y-4">
+                <h4 className="text-2xl font-semibold text-gray-800">Referral History</h4>
+                <div className="divide-y divide-gray-200 border border-gray-200 rounded-2xl shadow-md bg-white">
+                    <div className="grid grid-cols-3 p-4 text-sm font-bold text-gray-600 bg-gray-50 rounded-t-2xl">
+                        <div>Date</div>
+                        <div>Referred User</div>
+                        <div className="text-right">Points Earned</div>
+                    </div>
+                    {referral.history.map((item, index) => (
+                        <div key={index} className="grid grid-cols-3 p-4 text-base text-gray-700 transition duration-200 hover:bg-indigo-50">
+                            <div className="text-sm text-gray-500">{item.date}</div>
+                            <div className="text-indigo-600 font-medium">{item.user}</div>
+                            <div className="text-right font-bold text-green-600">+ {item.points}</div>
+                        </div>
+                    ))}
+                    {referral.history.length === 0 && (
+                         <div className="p-4 text-center text-base text-gray-500">No successful referrals yet.</div>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- ADDRESSES Component ---
+const Addresses = () => {
+    const { data: addresses, isLoading, isError } = useGetAddressesQuery();
+    
+    if (isLoading) return <LoadingSpinner message="Loading your saved addresses..." />;
+    if (isError) return <ErrorMessage message="Could not fetch addresses." />;
+    if (!addresses || addresses.length === 0) return (
+        <div className="space-y-6">
+            <h3 className="text-3xl font-extrabold text-gray-900 border-b pb-3 border-gray-100">Saved Addresses</h3>
+            <Message variant="info" message="You have no saved addresses." />
+            <Button variant="primary" icon={Plus} size="sm">Add New Address</Button>
+        </div>
+    );
+    
+    return (
+        <div className="space-y-6">
+            <h3 className="text-3xl font-extrabold text-gray-900 border-b pb-3 border-gray-100">Saved Addresses ({addresses.length})</h3>
+            <div className="space-y-4">
+                {addresses.map((addr) => (
+                    <div key={addr.id} className="p-5 border border-gray-200 rounded-2xl shadow-md bg-white transition duration-300 transform hover:shadow-lg hover:scale-[1.005]">
+                        <div className="flex justify-between items-start">
+                            <div className="space-y-1">
+                                <p className="font-bold text-gray-800 text-lg flex items-center">
+                                    <MapPin className="w-5 h-5 mr-2 text-indigo-500" />
+                                    {addr.type} 
+                                    {addr.isDefault && <span className="ml-3 px-3 py-1 text-xs font-semibold rounded-full bg-indigo-100 text-indigo-700 shadow-sm">Default</span>}
+                                </p>
+                                <p className="text-gray-700 text-base">{addr.line1}</p>
+                                <p className="text-gray-500 text-sm">{addr.city}, {addr.country}</p>
+                            </div>
+                            <div className="flex space-x-2">
+                                <Button size="sm" variant="secondary" onClick={() => alert('Edit Address')}>Edit</Button>
+                                <Button size="sm" variant="destructive" icon={Trash2}>Delete</Button>
+                            </div>
+                        </div>
+                    </div>
+                ))}
+            </div>
+            <Button variant="primary" icon={Plus} size="sm">Add New Address</Button>
+        </div>
+    );
+};
+
+// --- WALLET & PAYMENTS Component ---
+const WalletPayments = () => {
+    const { data: payments, isLoading, isError } = useGetPaymentMethodsQuery();
+    
+    if (isLoading) return <LoadingSpinner message="Loading payment methods..." />;
+    if (isError) return <ErrorMessage message="Could not fetch payment methods." />;
+    if (!payments || payments.length === 0) return (
+        <div className="space-y-6">
+            <h3 className="text-3xl font-extrabold text-gray-900 border-b pb-3 border-gray-100">Saved Payment Methods</h3>
+            <Message variant="info" message="You have no saved payment methods." />
+            <Button variant="primary" icon={Plus} size="sm">Add New Card</Button>
+        </div>
+    );
+
+    return (
+        <div className="space-y-6">
+            <h3 className="text-3xl font-extrabold text-gray-900 border-b pb-3 border-gray-100">Saved Payment Methods ({payments.length})</h3>
+            <div className="space-y-4">
+                {payments.map((card) => (
+                    <div key={card.id} className="p-5 border border-gray-200 rounded-2xl shadow-md bg-white transition duration-300 transform hover:shadow-lg hover:scale-[1.005]">
+                        <div className="flex justify-between items-start">
+                            <div className="space-y-1">
+                                <p className="font-bold text-gray-800 text-lg flex items-center">
+                                    <CreditCard className="w-5 h-5 mr-2 text-indigo-500" />
+                                    {card.type} ending in {card.last4}
+                                    {card.isDefault && <span className="ml-3 px-3 py-1 text-xs font-semibold rounded-full bg-indigo-100 text-indigo-700 shadow-sm">Default</span>}
+                                </p>
+                                <p className="text-sm text-gray-500">Expires: {card.expiry}</p>
+                            </div>
+                            <Button size="sm" variant="destructive" icon={Trash2} onClick={() => alert('Delete Card')}>Delete</Button>
+                        </div>
+                    </div>
+                ))}
+            </div>
+            <Button variant="primary" icon={Plus} size="sm">Add New Card</Button>
+        </div>
+    );
+};
+
+// --- SECURITY Component ---
+const SecurityPrivacy = () => {
+    const { data: sessions, isLoading, isError } = useGetSessionsQuery();
+    const [revokeSession, { isLoading: isRevoking }] = useRevokeSessionMutation();
+    
+    if (isLoading) return <LoadingSpinner message="Loading security data..." />;
+    if (isError) return <ErrorMessage message="Failed to load security settings." />;
+    
+    const handleRevoke = async (sessionId) => {
+        try {
+            await revokeSession(sessionId);
+            alert(`Session ${sessionId} revoked (mocked).`);
+        } catch (err) {
+            console.error("Failed to revoke session:", err);
+        }
+    };
+
+    return (
+        <div className="space-y-8">
+            <h3 className="text-3xl font-extrabold text-gray-900 border-b pb-3 border-gray-100">Security & Access</h3>
+            
+            <div className="p-5 border border-indigo-200 rounded-2xl flex justify-between items-center bg-indigo-50 shadow-lg">
+                <div>
+                    <div className="font-bold text-lg text-indigo-800 flex items-center">
+                        <Lock className="w-6 h-6 mr-3 text-indigo-600" />
+                        Two-Factor Authentication (2FA)
+                    </div>
+                    <p className="text-sm text-indigo-600 mt-1">
+                        {MOCK_PROFILE.twoFactorEnabled ? 'Enabled. Your account is protected.' : 'Disabled. Enable for maximum security.'}
+                    </p>
+                </div>
+                <Button variant={MOCK_PROFILE.twoFactorEnabled ? 'secondary' : 'primary'} size="sm">
+                    {MOCK_PROFILE.twoFactorEnabled ? 'Disable 2FA' : 'Enable 2FA'}
+                </Button>
+            </div>
+            
+            <div className="space-y-4">
+                <h4 className="text-2xl font-semibold text-gray-800">Active Sessions ({sessions?.length || 0})</h4>
+                <div className="divide-y divide-gray-200 border border-gray-200 rounded-2xl shadow-md bg-white">
+                    {sessions?.map(session => (
+                        <div key={session.id} className="p-4 flex justify-between items-center transition duration-200 hover:bg-gray-50">
+                            <div className="flex items-center space-x-4">
+                                <Monitor className="w-5 h-5 text-gray-500" />
+                                <div>
+                                    <p className="font-medium text-gray-900 text-base">
+                                        {session.device} 
+                                        {session.current && <span className="ml-2 px-2 py-0.5 text-xs font-semibold rounded-full bg-green-100 text-green-800 shadow-sm">Current</span>}
+                                    </p>
+                                    <p className="text-sm text-gray-500">
+                                        {session.location} &middot; Last Active: {session.lastActive}
+                                    </p>
+                                </div>
+                            </div>
+                            {!session.current && (
+                                <button 
+                                    onClick={() => handleRevoke(session.id)}
+                                    disabled={isRevoking}
+                                    className="text-red-500 hover:text-red-700 text-sm font-medium transition duration-200 disabled:opacity-50 hover:underline"
+                                >
+                                    {isRevoking ? <Loader2 className="w-4 h-4 inline-block animate-spin" /> : 'Revoke'}
+                                </button>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- NOTIFICATIONS Component ---
+const Notifications = () => {
+    const { data: prefs, isLoading, isError } = useGetNotificationPreferencesQuery();
+    
+    const [localPrefs, setLocalPrefs] = useState(NOTIFICATION_INITIAL_STATE);
+    
+    useEffect(() => {
+        if (prefs) {
+            setLocalPrefs(prefs);
+        }
+    }, [prefs]);
+    
+    if (isLoading) return <LoadingSpinner message="Loading notification preferences..." />;
+    if (isError) return <ErrorMessage message="Could not fetch preferences." />;
+    if (!prefs) return <Message variant="error" message="Notification data not available." />;
+    
+    const handleToggle = (medium, type) => {
+        setLocalPrefs(prev => ({
+            ...prev,
+            [medium]: {
+                ...prev[medium],
+                [type]: !prev[medium][type]
+            }
+        }));
+    };
+
+    const ToggleItem = ({ medium, type, label, checked }) => (
+        <div className="flex justify-between items-center py-4 transition duration-200 hover:bg-gray-50 rounded-lg -mx-4 px-4">
+            <span className="text-gray-700 text-base">{label}</span>
+            <input 
+                type="checkbox" 
+                checked={checked} 
+                onChange={() => handleToggle(medium, type)}
+                className="w-6 h-6 text-indigo-600 border-gray-300 rounded-md focus:ring-indigo-500 transition duration-150 transform hover:scale-110 cursor-pointer"
+            />
+        </div>
+    );
+    
+    return (
+        <div className="space-y-8">
+            <h3 className="text-3xl font-extrabold text-gray-900 border-b pb-3 border-gray-100">Notification Preferences</h3>
+            
+            {/* Email Preferences */}
+            <div className="p-6 border border-gray-200 rounded-2xl shadow-lg bg-white">
+                <h4 className="text-2xl font-bold text-gray-800 mb-4 flex items-center pb-2 border-b border-gray-100">
+                    <Zap className="w-6 h-6 mr-3 text-yellow-500" />
+                    Email Notifications
+                </h4>
+                <div className="divide-y divide-gray-100">
+                    <ToggleItem medium="email" type="restock" label="Product Restock Alerts" checked={localPrefs.email.restock} />
+                    <ToggleItem medium="email" type="promo" label="Promotions & Offers" checked={localPrefs.email.promo} />
+                    <ToggleItem medium="email" type="updates" label="System Updates & Policy Changes" checked={localPrefs.email.updates} />
+                </div>
+            </div>
+
+            {/* In-App Preferences */}
+            <div className="p-6 border border-gray-200 rounded-2xl shadow-lg bg-white">
+                <h4 className="text-2xl font-bold text-gray-800 mb-4 flex items-center pb-2 border-b border-gray-100">
+                    <Bell className="w-6 h-6 mr-3 text-green-500" />
+                    In-App Alerts
+                </h4>
+                <div className="divide-y divide-gray-100">
+                    <ToggleItem medium="inApp" type="messages" label="Customer Service Messages" checked={localPrefs.inApp.messages} />
+                    <ToggleItem medium="inApp" type="priceDrop" label="Wishlist Price Drop Alerts" checked={localPrefs.inApp.priceDrop} />
+                </div>
+            </div>
+            <div className="flex justify-end">
+                <Button icon={Save} size="sm">Save Preferences</Button>
+            </div>
+        </div>
+    );
+};
+
+
+// ====================================================================
+// D. Main Dashboard Layout
+// ====================================================================
+
+const navItems = [
+  { id: 'profile', label: 'Profile', icon: User, content: Profile },
+  { id: 'orders', label: 'Order History', icon: History, content: OrderHistory },
+  { id: 'reviews', label: 'My Reviews', icon: Star, content: MyReviews },
+  { id: 'referrals', label: 'Referral Program', icon: Gift, content: ReferralProgram },
+  { id: 'addresses', label: 'Addresses', icon: MapPin, content: Addresses },
+  { id: 'payments', label: 'Wallet & Payments', icon: CreditCard, content: WalletPayments },
+  { id: 'security', label: 'Security & Privacy', icon: Lock, content: SecurityPrivacy },
+  { id: 'notifications', label: 'Notifications', icon: Bell, content: Notifications },
+];
+
+function UserDashboard() {
+  const [activeTab, setActiveTab] = useState('profile');
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
+  const ActiveContent = navItems.find(item => item.id === activeTab)?.content || Profile;
+
+  const NavItem = ({ id, label, icon: Icon }) => {
+    const isActive = id === activeTab;
+    // Enhanced classes for attractive UI and animation
+    const baseClasses = "flex items-center space-x-3 p-4 rounded-2xl cursor-pointer transition-all duration-300 ease-in-out font-medium transform active:scale-[0.98]";
+    
+    const activeClasses = "bg-indigo-600 text-white shadow-xl shadow-indigo-500/40 scale-[1.02]";
+    const inactiveClasses = "text-gray-600 hover:bg-indigo-50 hover:text-indigo-700 hover:translate-x-1";
+
+    return (
+      <div 
+        className={`${baseClasses} ${isActive ? activeClasses : inactiveClasses}`}
+        onClick={() => {
+          setActiveTab(id);
+          setIsMobileMenuOpen(false); 
+        }}
+      >
+        <Icon className="w-6 h-6" />
+        <span className="text-lg">{label}</span>
+        {isActive && <ChevronRight className="w-5 h-5 ml-auto"/>}
+      </div>
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-4 sm:p-8 md:p-12 font-sans">
+      <div className="max-w-7xl mx-auto">
+        <h1 className="text-4xl sm:text-5xl font-extrabold text-gray-900 mb-10 border-b-4 border-indigo-100 pb-3">
+          User Account Hub
+        </h1>
+        
+        {/* Mobile Menu Toggle */}
+        <div className="sm:hidden mb-6">
+          <Button
+            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+            variant="secondary"
+            icon={Menu}
+            size="md"
+          >
+            {isMobileMenuOpen ? 'Close Menu' : `View: ${navItems.find(item => item.id === activeTab)?.label}`}
+          </Button>
+        </div>
+
+        {/* Main Layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-10">
+          
+          {/* Sidebar / Navigation */}
+          <aside 
+            className={`
+              lg:col-span-1 
+              bg-white 
+              rounded-3xl shadow-2xl 
+              p-6 transition-all duration-500 ease-in-out
+              lg:block 
+              ${isMobileMenuOpen ? 'block' : 'hidden'}
+            `}
+          >
+            <div className="flex flex-col space-y-2">
+              <h2 className="text-xl font-bold text-gray-800 mb-4">Settings</h2>
+              {navItems.map(item => (
+                <NavItem key={item.id} {...item} />
+              ))}
+
+              <div className="pt-6 mt-4 border-t border-gray-100">
+                <div className="flex items-center space-x-3 p-4 rounded-2xl cursor-pointer text-red-500 hover:bg-red-50 font-medium transition duration-300 transform active:scale-[0.98] hover:translate-x-1">
+                  <LogOut className="w-6 h-6" />
+                  <span className="text-lg">Logout</span>
+                </div>
+              </div>
+            </div>
+          </aside>
+
+          {/* Content Area */}
+          <main className="lg:col-span-4">
+            <div className="bg-white rounded-3xl shadow-2xl p-6 sm:p-8 lg:p-10 min-h-[70vh] border border-gray-100">
+              <ActiveContent />
+            </div>
+          </main>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default UserDashboard;

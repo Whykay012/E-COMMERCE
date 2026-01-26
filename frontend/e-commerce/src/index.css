@@ -1,0 +1,38 @@
+/* @tailwind base;
+@tailwind components;
+@tailwind utilities; */
+@import "tailwindcss";
+/* src/index.css */
+body {
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial;
+  background: #f5f7fb;
+  color: #0f172a;
+  margin: 0;
+}
+a {
+  /* color: #0369a1; */
+  text-decoration: none;
+}
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+:root {
+  --theme-primary: #3b82f6; /* blue */
+}
+
+[data-theme="purple"] {
+  --theme-primary: #8b5cf6;
+}
+
+[data-theme="emerald"] {
+  --theme-primary: #10b981;
+}
+
+body {
+  --color-primary: var(--theme-primary);
+}
+.theme-transition {
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
