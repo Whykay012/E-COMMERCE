@@ -11,7 +11,7 @@ const {
   verifyAuthenticationResponse,
 } = require("@simplewebauthn/server");
 
-const { getRedisClient } = require("../lib/redisCacheClient");
+const { getRedisClient } = require("../event/lib/redisCacheClient");
 const User = require("../models/user.model");
 const Logger = require("../utils/logger");
 const Tracing = require("../utils/tracingClient");

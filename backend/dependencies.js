@@ -11,7 +11,7 @@ const {
   getPrimaryClient,
   connectRedis,
   disconnectRedis,
-} = require("./utils/redisClient");
+} = require("./lib/redisClient");
 const { initSecurityScripts } = require("./lib/redisInitialization"); // ⭐ ADDED
 const AuditLogger = require("./services/auditLogger");
 const MessageBroker = require("./services/messageBrokerClient");

@@ -7,7 +7,7 @@ const Referral = require('../model/Referral');
 const mongoose = require('mongoose');
 
 // ✅ Correct Redis usage
-const { getRedisClient } = require('../utils/redisClient');
+const { getRedisClient } = require('../event/lib/redisClient');
 const redis = getRedisClient();
 
 // ✅ Structured logger

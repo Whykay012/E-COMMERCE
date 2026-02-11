@@ -1,83 +1,43 @@
 /**
- * workers/cacheConsumer.js
- * ZENITH OMEGA - Cache Invalidation Worker (Kafka)
+ * ZENITH OMEGA - CACHE INVALIDATION WORKER
+ * Listen to: Titan Nexus Kafka
+ * Purpose: Ensure global cache consistency across the cluster
  */
-const { Kafka } = require('kafkajs');
-const cache = require("../services/redisCacheUtil");
-const logger = require("../config/logger");
-const Metrics = require("../utils/metricsClient");
+const broker = require('../services/messageBrokerClient');
+const cache = require('../lib/redisCacheUtil');
+const Logger = require('../utils/logger');
+const Metrics = require('../utils/metricsClient');
 
-const kafka = new Kafka({
-    clientId: 'omega-cache-cluster',
-    brokers: process.env.KAFKA_BROKERS ? process.env.KAFKA_BROKERS.split(',') : ['localhost:9092']
-});
+const TOPIC = 'cache-invalidation-topic';
+const CONSUMER_GROUP = 'notif-cache-invalidator-group';
 
-const consumer = kafka.consumer({ groupId: 'cache-invalidation-group' });
-
-/**
- * @desc Connects and starts the Kafka polling loop
- */
-const startCacheConsumer = async () => {
+async function startCacheInvalidator() {
     try {
-        await consumer.connect();
-        // Subscribe to the invalidation topic
-        await consumer.subscribe({ topic: 'cache-invalidation-topic', fromBeginning: false });
+        await broker.subscribe(TOPIC, CONSUMER_GROUP, async (message) => {
+            const { action, userId, timestamp } = message;
 
-        logger.info("[Kafka:Consumer] Cache Invalidation Worker online and subscribed.");
+            Logger.info('CACHE_INVALIDATION_RECEIVED', { action, userId, timestamp });
 
-        await consumer.run({
-            eachMessage: async ({ topic, partition, message }) => {
-                const startTime = Date.now();
+            if (action === 'PURGE_USER') {
+                const start = Date.now();
                 
-                try {
-                    const rawData = message.value.toString();
-                    const payload = JSON.parse(rawData);
+                // 💡 Use Option B's purgePattern to wipe all paginated notification fragments
+                // This clears: notifs:u:123:c:start:l:10, notifs:u:123:c:next:l:10, etc.
+                const pattern = `notifs:u:${userId}:*`;
+                const deletedCount = await cache.purgePattern(pattern);
 
-                    logger.debug(`[Cache:Purge] Processing ${payload.action} for User: ${payload.userId}`);
+                Metrics.timing('cache.purge_latency', Date.now() - start);
+                Metrics.increment('cache.purge_success', deletedCount);
 
-                    if (payload.action === 'PURGE_USER') {
-                        // 1. Generate keys to invalidate based on user prefix
-                        const userPrefix = `notifs:u:${payload.userId}:*`;
-                        
-                        // 2. Perform the delete via the shared redis client
-                        const keys = await cache.client.keys(userPrefix);
-                        if (keys.length > 0) {
-                            await cache.client.del(...keys);
-                            logger.info(`[Cache:Purge] Successfully invalidated ${keys.length} keys for user ${payload.userId}`);
-                        }
-                    }
-
-                    // 3. Track Metrics
-                    Metrics.increment('cache.worker.purge_success');
-                    Metrics.timing('cache.worker.processing_time', Date.now() - startTime);
-
-                } catch (err) {
-                    logger.error("[Cache:Worker] Failed to process purge message", { error: err.message });
-                    Metrics.increment('cache.worker.purge_failure');
-                }
-            },
+                Logger.debug('USER_CACHE_PURGED', { userId, keysDeleted: deletedCount });
+            }
         });
-    } catch (error) {
-        logger.error("[Kafka:Consumer] Fatal error starting consumer", { error: error.message });
-        throw error; // Re-throw to be caught by the boot sequence
-    }
-};
 
-/**
- * @desc Gracefully disconnects from the Kafka cluster
- */
-const stopCacheConsumer = async () => {
-    try {
-        logger.info("[Kafka:Consumer] Disconnecting from brokers...");
-        await consumer.disconnect();
-        logger.info("[Kafka:Consumer] Disconnected successfully.");
-    } catch (error) {
-        logger.error("[Kafka:Consumer] Error during disconnection", { error: error.message });
+        Logger.info(`[WORKER] Cache Invalidator active on ${TOPIC}`);
+    } catch (err) {
+        Logger.error('[WORKER:CRITICAL] Cache Invalidator failed to start', { error: err.message });
+        process.exit(1);
     }
-};
+}
 
-// EXPORT BOTH FUNCTIONS
-module.exports = { 
-    startCacheConsumer, 
-    stopCacheConsumer 
-};
+module.exports = { startCacheInvalidator };

@@ -3,7 +3,10 @@
 const ComplianceOutbox = require('../model/complianceOutbox'); // Ensure path is correct
 const Logger = require('../utils/logger');
 // Assuming paths for error handling and queueing helper
-const { UnauthorizedError, BadRequestError, InternalServerError } = require('../errors'); 
+
+const UnauthorizedError = require("../errors/unauthenication-error");
+const AuthenticationError = require("../errors/unauthenication-error");
+const InternalServerError = require("../errors/internalServerError");
 const { queueJob, GENERAL_QUEUE_NAME } = require('../queues/jobQueue'); 
 
 

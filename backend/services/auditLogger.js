@@ -3,11 +3,12 @@
 // --- External Dependencies ---
 const queueClient = require('./logQueueClient'); 
 const localPersistence = require('./logPersistenceClient'); // For the DLQ/Internal Queue
-const logQueryClient = require('./logQueryClient'); 
+const logQueryClient = require('./logQueueClient'); 
 const Metrics = require('../utils/metricsClient'); // 💡 UPGRADE: Telemetry
 const Tracing = require('../utils/tracingClient'); // 🚀 CRITICAL: Import Tracing for context propagation
 const Logger = require('../utils/logger'); // 🚀 CRITICAL: Import the ULTIMATE PINO LOGGER for reporting
-const { InternalServerError } = require('../errors/custom-errors'); // Assuming custom errors are available
+
+const { InternalServerError } = require('../errors/internalServerError');
 const { v4: uuidv4 } = require('uuid'); 
 const { context, trace } = require('@opentelemetry/api'); // 💡 Explicitly import OTel context for propagation
 

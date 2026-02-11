@@ -1,6 +1,6 @@
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
-const { BadRequestError } = require("../errors/customErrors");
+const { BadRequestError } = require("../errors/bad-request-error");
 
 /**
  * @desc Consistent hashing for sensitive lookup tokens (Verification, OTP, Password Reset).

@@ -4,9 +4,9 @@
 
 const Logger = require('../utils/logger');
 const Tracing = require('../utils/tracingClient');
-const ForbiddenError = require('../errors/forbidden-error');
+const ForbiddenError = require('../errors/forbiddenError');
 const Metrics = require('../utils/metricsClient');
-const InternalServerError = require('../errors/internal-server-error');
+const InternalServerError = require('../errors/internalServerError');
 
 // --- 💡 Real-Time Dependencies ---
 const PolicyPushListener = require('../utils/policyPushListener'); 

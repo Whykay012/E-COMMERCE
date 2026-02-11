@@ -2,7 +2,7 @@
 
 const Logger = require('../utils/logger');
 const Tracing = require('../utils/tracingClient');
-const { getRedisPubSubClient } = require('../utils/redisClient'); 
+const { getRedisPubSubClient } = require('../event/lib/redisClient'); 
 const SessionStore = require('../data/sessionStore'); // PEAK: Assume a way to read/delete primary session state
 const ResilienceQueue = require('../utils/resilienceQueueClient'); // PEAK: Queue for failed events
 

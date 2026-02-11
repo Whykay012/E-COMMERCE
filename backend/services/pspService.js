@@ -8,7 +8,7 @@
 const { BadRequestError,  } = require("../errors/bad-request-error");
 const { NotFoundError,  } = require("../errors/notFoundError");
 const { ConflictError } = require("../errors/onflictError");
-const TransientPaymentError = require("../lib/errorClasses"); // Custom error for retryable failures
+const TransientPaymentError = require("../event/lib/errorClasses"); // Custom error for retryable failures
 const { v4: uuidv4 } = require('uuid'); // Import UUID for trace IDs
 
 // --- 1. Static Environment Secrets & URLs ---

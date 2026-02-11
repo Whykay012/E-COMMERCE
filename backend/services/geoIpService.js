@@ -3,14 +3,14 @@
 // Fully integrated with Tracing, Advanced Logging, Metrics, Adaptive Caching, and Risk Engine.
 
 const geoIpReader = require("./maxMindReader");
-const cache = require("../cache/redisCacheUtil");
+const cache = require("../lib/redisCacheUtil");
 const Tracing = require("../utils/tracingClient"); // Distributed Tracing Client
 const Metrics = require("../utils/metricsClient"); // Distributed Telemetry Client (StatsD)
 const logger = require("../utils/logger"); // Advanced Pino Logger (for operational events)
 const auditLogger = require("./auditLogger"); // Conceptual Audit Logger (for security/business events)
 
 const { BLOCKED_COUNTRIES, CHALLENGE_COUNTRIES, countryStatus } = require("./risk/policies");
-const { Queue, Worker, QueueScheduler } = require("bullmq");
+const { Queue, Worker } = require("bullmq");
 const Redis = require("ioredis");
 
 // ---------------- CONFIG ----------------
@@ -19,10 +19,13 @@ const GEOIP_STALE_TTL = Number(process.env.GEOIP_STALE_TTL_SECONDS) || 60 * 60; 
 const EARTH_RADIUS_KM = 6371;
 
 // ---------------- BULLMQ SETUP ----------------
-const connection = new Redis(process.env.REDIS_URL || "redis://localhost:6379", { maxRetriesPerRequest: null, enableReadyCheck: false });
+const connection = { 
+    host: process.env.REDIS_HOST || '127.0.0.1', 
+    port: process.env.REDIS_PORT || 6379,
+    maxRetriesPerRequest: null // ✅ MUST be null for BullMQ stability
+};
 const geoipQueueName = "geoip-refresh-queue";
 
-const geoipQueueScheduler = new QueueScheduler(geoipQueueName, { connection });
 const geoipQueue = new Queue(geoipQueueName, { connection });
 
 const toRad = deg => deg * (Math.PI / 180);
@@ -55,7 +58,7 @@ const geoipWorker = new Worker(
                         // I'll keep the original logic, assuming cache utility handles stale read internally.
                         await cache.set(`stale:${cacheKey}`, normalized, GEOIP_STALE_TTL);
                         
-                        const durationMs = Number(process.hrtime.bigint() - start) / 1e6;
+                       const durationMs = Number((process.hrtime.bigint() - start) / 1000000n); // Force BigInt math then convert to Number
                         Metrics.timing("geoip.worker.duration_ms", durationMs, { status: 'success' });
                         Metrics.increment("geoip.worker.refresh_success_total");
                         
@@ -127,7 +130,7 @@ async function lookupLocation(ip) {
                     const raw = geoIpReader.lookupSync ? geoIpReader.lookupSync(ip) : await geoIpReader.lookup(ip);
                     const normalized = normalizeRaw(raw);
                     
-                    const lookupDurationMs = Number(process.hrtime.bigint() - lookupStart) / 1e6;
+                    const lookupDurationMs = Number((process.hrtime.bigint() - lookupStart) / 1000000n);
                     Metrics.timing("geoip.direct_lookup.latency_ms", lookupDurationMs, { result: normalized ? 'hit' : 'miss' });
                     span.addEvent("direct_db_lookup", { cached: false, duration_ms: lookupDurationMs });
                     return normalized;
@@ -350,7 +353,7 @@ async function assessRisk({ userId, ip, userAgent, lastKnownLocation, thresholds
         span.setAttributes({ 'risk.score': score, 'risk.action': action });
         span.setStatus({ code: Tracing.SpanStatusCode.OK });
 
-        const durationMs = Number(process.hrtime.bigint() - start) / 1e6;
+const durationMs = Number((process.hrtime.bigint() - start) / 1000000n); // Force BigInt math then convert to Number
         Metrics.timing("risk.assessment.duration_ms", durationMs, { action: action });
         Metrics.gauge("risk.last_score", score, { user: userId, action: action });
 
@@ -360,8 +363,9 @@ async function assessRisk({ userId, ip, userAgent, lastKnownLocation, thresholds
 
 // ---------------- HELPERS ----------------
 function isCountryAllowed(iso) {
+    if (!iso || iso === "UNK") return { allowed: false, reason: "unknown_origin" };
     const { status } = countryStatus(iso);
-    return { allowed: status === "allowed", reason: status };
+    return { allowed: status !== "blocked", reason: status };
 }
 
 // ---------------- INTEGRATION HOOKS ----------------
@@ -375,29 +379,26 @@ async function evaluatePaymentRisk(opts) { return assessRisk({ ...opts, context:
  * @desc Initializes all core enterprise services (Tracing, Metrics, Logging)
  */
 async function initialize() {
-    // 1. Initialize Tracing first so all subsequent logs/metrics can be enriched
     await Tracing.initialize(); 
     logger.initialize();
     Metrics.initialize();
     logger.info("GEOIP_SERVICE_INITIALIZING");
 }
 
-/**
- * @desc Gracefully shuts down all core enterprise services.
- */
 async function shutdown() {
     logger.info("GEOIP_SERVICE_SHUTTING_DOWN");
-    // Shutdown in reverse order: Logger/Metrics flush, then Tracing flush last
-    Metrics.shutdown(); // StatsD client closure
-    await Tracing.shutdown(); // OTel Span flush
-    await logger.shutdown(); // Pino Worker flush
-    connection.disconnect();
-    await geoipQueueScheduler.close();
+
+    // 1. Stop processing NEW jobs first
     await geoipWorker.close();
     await geoipQueue.close();
-    logger.info("GEOIP_SERVICE_SHUTDOWN_COMPLETE"); // This log might not be flushed by the time worker terminates
-}
 
+    // 2. Now that work is stopped, flush telemetry
+    Metrics.shutdown(); 
+    await Tracing.shutdown(); 
+    await logger.shutdown(); 
+
+    logger.info("GEOIP_SERVICE_SHUTDOWN_COMPLETE");
+}
 
 // ---------------- EXPORT ----------------
 module.exports = {
@@ -407,11 +408,10 @@ module.exports = {
     evaluateLoginRisk,
     evaluatePaymentRisk,
     isCountryAllowed,
-    initialize, // New lifecycle hook
-    shutdown, // New lifecycle hook
-
+    initialize, 
+    shutdown,
     // Expose BullMQ elements for external service management
     queue: geoipQueue,
     worker: geoipWorker, 
-    scheduler: geoipQueueScheduler,
+   
 };

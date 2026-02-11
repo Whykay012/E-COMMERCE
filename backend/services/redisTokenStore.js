@@ -1,6 +1,8 @@
 const Redis = require('ioredis');
-const { Logger, Tracing, Metrics } = require('../utils/telemetry');
-const InternalServerError = require('../errors/internal-server-error');
+const Tracing = require("../utils/tracingClient");
+const Metrics = require("../utils/metricsClient");
+const Logger = require("../utils/logger");
+const InternalServerError = require('../errors/internalServerError');
 
 // --- 💎 Minified Config: Saves ~40% RAM at scale ---
 const PREFIX = {

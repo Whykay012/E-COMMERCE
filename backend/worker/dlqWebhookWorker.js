@@ -5,7 +5,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-const { getRedisClient } = require("../utils/redisClient");
+const { getRedisClient } = require("../event/lib/redisClient");
 const { getFabricStatus } = require("../services/healthService");
 const { DLQ_QUEUE_NAME } = require("../utils/preventReplay");
 const logger = require("../utils/logger");

@@ -1,4 +1,4 @@
-const { connectRedis, checkHealth } = require("./utils/redisClient");
+const { connectRedis, checkHealth } = require("../event/lib/redisClient");
 const { temporarilyBlock, isBlocked } = require("./utils/blocklist");
 const { createRateLimiterFactory } = require("./services/rateLimiters/rateLimiterFactory");
 const { SCRIPTS } = require("./services/rateLimiters/luaScripts");

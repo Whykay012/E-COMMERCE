@@ -11,10 +11,10 @@ const zod = require("zod");
 const { promisify } = require("util");
 
 // Errors & Models
-const InternalServerError = require("../errors/internal-server-error");
+const InternalServerError = require("../errors/internalServerError");
 const UnauthorizedError = require("../errors/unauthenication-error");
 const BadRequestError = require("../errors/bad-request-error");
-const Outbox = require("../model/outboxModel");
+const Outbox = require("../model/outbox");
 const User = require("../model/userModel");
 
 // Infrastructure
@@ -159,69 +159,135 @@ const handlePasswordRotation = async (data, job) => {
 /**
  * Initiates Password Reset (High-Security Flow)
  */
-// const initiatePasswordReset = async (identifier, context, session) => {
-//     return Tracing.withSpan('auth.reset.initiate', async (span) => {
-//         const { ip, traceId } = context;
+/**
+ * 🔐 ZENITH IDENTITY: Password Reset Orchestration
+ * Architecture: Hybrid Transactional State Machine
+ * Features: Enumeration Protection, Rate Limiting, Outbox Persistence, Tracing.
+ */
+const initiatePasswordReset = async (identifier, context, externalSession = null) => {
+  // 1. SESSION MANAGEMENT: Support both local and injected transactions
+  const session = externalSession || (await mongoose.startSession());
+  const isLocalSession = !externalSession;
 
-//         const user = await User.findOne({
-//             $or: [{ username: identifier }, { email: identifier }]
-//         }).session(session);
+  if (isLocalSession) session.startTransaction();
 
-//         if (!user) {
-//             Logger.warn('RESET_ATTEMPT_USER_NOT_FOUND', { identifier, ip });
-//             Metrics.increment('auth.reset.initiate.fail', { reason: 'enumeration_prevention' });
-//             return;
-//         }
+  return await Tracing.withSpan("auth.reset.initiate", async (span) => {
+    try {
+      const { ip, traceId } = context;
 
-//         const userId = user._id.toString();
-//         span.setAttribute('user.id', userId);
+      // 2. IDENTITY LOOKUP (Atomic & Scoped to Session)
+      const user = await User.findOne({
+        $or: [{ username: identifier }, { email: identifier }],
+      }).session(session);
 
-//         const { isRateLimited, timeToWaitMinutes } = await passwordResetLimiter.checkAttempt(userId, ip);
-//         if (isRateLimited) {
-//             AuditLogger.log({
-//                 level: 'SECURITY',
-//                 event: 'RESET_RATE_LIMITED',
-//                 userId,
-//                 details: { ip, timeToWaitMinutes }
-//             });
-//             Metrics.increment('auth.reset.initiate.fail', { reason: 'rate_limit' });
-//             throw new BadRequestError(`You have exceeded the reset limit. Please wait ${timeToWaitMinutes} minutes.`);
-//         }
+      if (!user) {
+        // Log locally for security monitoring but return success to the client
+        Logger.warn("RESET_ATTEMPT_USER_NOT_FOUND", { identifier, ip });
+        Metrics.increment("auth.reset.initiate.fail", { reason: "enumeration_prevention" });
+        
+        if (isLocalSession) await session.commitTransaction();
+        return { success: true };
+      }
 
-//         const rawResetToken = crypto.randomBytes(64).toString("hex");
-//         const hashedResetToken = crypto.createHash("sha256").update(rawResetToken).digest("hex");
-//         const expiry = new Date(Date.now() + (process.env.RESET_TOKEN_VALID_MINUTES || 60) * 60 * 1000);
+      const userId = user._id.toString();
+      span.setAttribute("user.id", userId);
 
-//         user.passwordResetToken = hashedResetToken;
-//         user.passwordResetExpires = expiry;
-//         await user.save({ session, validateBeforeSave: false });
+      // 3. SECURITY GUARD: Rate Limiting
+      const { isRateLimited, timeToWaitMinutes } = await passwordResetLimiter.checkAttempt(userId, ip);
+      
+      if (isRateLimited) {
+        AuditLogger.log({
+          level: "SECURITY",
+          event: "RESET_RATE_LIMITED",
+          userId,
+          details: { ip, timeToWaitMinutes },
+        });
+        Metrics.increment("auth.reset.initiate.fail", { reason: "rate_limit" });
+        
+        throw new BadRequestError(
+          `You have exceeded the reset limit. Please wait ${timeToWaitMinutes} minutes.`
+        );
+      }
 
-//         await passwordResetLimiter.recordAttempt(userId, ip, session);
+      // 4. CRYPTOGRAPHIC ENTROPY: Token Generation
+      // 64-byte random string for maximum security against brute force
+      const rawResetToken = crypto.randomBytes(64).toString("hex");
+      const hashedResetToken = crypto.createHash("sha256").update(rawResetToken).digest("hex");
+      
+      // Default to 60 minutes if env is missing
+      const ttlMinutes = parseInt(process.env.RESET_TOKEN_VALID_MINUTES) || 60;
+      const expiry = new Date(Date.now() + ttlMinutes * 60 * 1000);
 
-//         const [event] = await Outbox.create([{
-//             aggregateId: userId,
-//             eventType: 'PASSWORD_RESET_REQUESTED',
-//             traceId: traceId,
-//             payload: {
-//                 email: user.email,
-//                 token: rawResetToken,
-//                 link: `${process.env.CLIENT_URL}/reset-password?token=${rawResetToken}`
-//             },
-//             status: 'PENDING'
-//         }], { session });
+      // 5. ATOMIC STATE UPDATE
+      user.passwordResetToken = hashedResetToken;
+      user.passwordResetExpires = expiry;
+      // validateBeforeSave: false is used because we only want to update these specific security fields
+      await user.save({ session, validateBeforeSave: false });
 
-//         emailDispatchBreaker.fire('jobs', {
-//             name: "auth.email_relay",
-//             data: { eventId: event._id, type: 'PASSWORD_RESET', traceId }
-//         }).catch(err => {
-//             Logger.critical('EMAIL_HINT_DELAYED', { userId, reason: err.message });
-//         });
+      // Record the attempt within the transaction to prevent race conditions
+      await passwordResetLimiter.recordAttempt(userId, ip, session);
 
-//         Metrics.increment('auth.reset.initiate.success', { userId });
-//         return { success: true };
-//     });
-// };
+      // 6. RELIABLE MESSAGING: Outbox Pattern
+      // This ensures the email is ONLY sent if the database update actually succeeds.
+      const [event] = await Outbox.create(
+        [
+          {
+            aggregateId: userId,
+            eventType: "PASSWORD_RESET_REQUESTED",
+            traceId: traceId,
+            payload: {
+              email: user.email,
+              token: rawResetToken,
+              link: `${process.env.CLIENT_URL}/reset-password?token=${rawResetToken}`,
+            },
+            status: "PENDING",
+            priority: 10, // Security events take priority in the worker queue
+          },
+        ],
+        { session }
+      );
 
+      // 7. TRANSACTION COMMIT
+      if (isLocalSession) {
+        await session.commitTransaction();
+      }
+
+      // 8. ASYNC HINT: Fire-and-forget background job notification
+      // We do this AFTER commit. If the breaker fails, the Outbox worker will eventually pick it up anyway.
+      emailDispatchBreaker
+        .fire("jobs", {
+          name: "auth.email_relay",
+          data: { eventId: event._id, type: "PASSWORD_RESET", traceId },
+        })
+        .catch((err) => {
+          Logger.critical("EMAIL_HINT_DELAYED", { userId, reason: err.message });
+        });
+
+      Metrics.increment("auth.reset.initiate.success", { userId });
+      
+      return { success: true };
+
+    } catch (error) {
+      // 9. ERROR HANDLING & ROLLBACK
+      if (isLocalSession && session.inTransaction()) {
+        await session.abortTransaction();
+      }
+      
+      Logger.error("PASSWORD_RESET_ORCHESTRATION_FAILED", {
+        identifier,
+        error: error.message,
+        traceId: context.traceId
+      });
+      
+      throw error;
+    } finally {
+      // 10. CLEANUP
+      if (isLocalSession) {
+        await session.endSession();
+      }
+    }
+  });
+};
 /**
  * Initiates Account Verification OTP
  */

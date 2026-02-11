@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const geo = require("../services/geoip/geoIpService");
-const { checkHealth } = require("../utils/redisClient");
+const { checkHealth } = require("../event/lib/redisClient");
 const { getFabricStatus } = require("../app_initializer");
 
 router.get("/geoip", async (req, res) => {

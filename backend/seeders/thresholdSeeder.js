@@ -3,8 +3,8 @@
  * ZENITH SECURITY - Persistent Threshold Seeder
  */
 const ThresholdConfig = require('../model/ThresholdConfig');
-const Logger = require('./logger');
-const Tracing = require('./tracingClient');
+const Logger = require('../config/logger');
+const Tracing = require('../utils/tracingClient');
 
 const seedThresholds = async () => {
     // Wrap in a span so we can track startup performance

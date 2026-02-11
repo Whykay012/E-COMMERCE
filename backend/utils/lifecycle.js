@@ -3,11 +3,11 @@
  */
 const { initHealthMonitor } = require("./healthMonitorFactory");
 const Outbox = require("./transactionalOutbox");
-const { seedThresholds } = require("./thresholdSeeder");
+const { seedThresholds } = require("../seeders/thresholdSeeder");
 const {
   initializeRedlock,
   initializeCacheSubscriber,
-} = require("./redisClient");
+} = require("../lib/redisClient");
 const { scheduleDailyCleanup } = require("../services/idempotencyService");
 const mongoose = require("mongoose");
 

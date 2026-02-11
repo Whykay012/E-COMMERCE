@@ -16,7 +16,7 @@ if (!process.env.REDIS_HOST) {
    =========================== */
 const BullMQAdapter = require('./BullMQAdapter');
 const SQSAdapter = require('./SQSAdapter');
-
+const InternalServerError = require("../errors/internalServerError")
 const adapterMap = {
     'BullMQ': BullMQAdapter,
     'SQS': SQSAdapter,

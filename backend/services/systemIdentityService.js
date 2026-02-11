@@ -5,10 +5,9 @@
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const UnauthorizedError = require("../errors/unauthenication-error");
-const InternalServerError = require("../errors/internal-server-error");
 const Logger = require("../utils/logger");
 const Tracing = require("../utils/tracingClient");
-const Metrics = require("../utils/metrics");
+const Metrics = require("../utils/metricsClient");
 
 // --- Configuration ---
 const M2M_TOKEN_TTL_SECONDS = 300;
@@ -25,8 +24,8 @@ const M2M_SIGNING_KEYS_ACTIVE = new Map();
 
 const M2M_CLIENT_STORE = {
   "payments-processor": {
-    secret: "super-secure-payments-secret",
-    scopes: ["payment:*", "fraud:check"], // ⭐ Point 2: Wildcards
+    secret: process.env.M2M_PAYMENTS_SECRET || "super-secure-payments-secret",
+    scopes: ["payment:*", "fraud:check"],
     issuer: EXPECTED_ISSUER,
     securityVersion: 1,
   },
@@ -39,7 +38,8 @@ const M2M_CLIENT_STORE = {
 };
 
 /**
- * @desc Generates/Fetches RSA Keypair and updates caches.
+ * @desc Generates RSA Keypair and syncs to memory caches.
+ * @param {string} keyId - Unique identifier for the key version.
  */
 const fetchSigningKeyPair = async (keyId) => {
   return Tracing.withSpan("m2m.generateKeyPair", async () => {
@@ -50,51 +50,43 @@ const fetchSigningKeyPair = async (keyId) => {
     });
 
     M2M_PUBLIC_KEYS_CACHE.set(keyId, publicKey);
-    // Set no expiry on the "Current" private key
     M2M_SIGNING_KEYS_ACTIVE.set(keyId, { key: privateKey, expires: null });
     return privateKey;
   });
 };
 
-const initialize = async () => {
-  if (M2M_SIGNING_KEYS_ACTIVE.size === 0) {
-    await fetchSigningKeyPair(CURRENT_KEY_ID);
-    Logger.info("SYSTEM_IDENTITY_INITIALIZED", { keyId: CURRENT_KEY_ID });
-  }
-};
-
 /**
- * @desc ⭐ POINT 1 IMPLEMENTED: Graceful Rotation
- * Prevents race conditions by keeping the old private key active for 60s.
+ * @desc Rotates keys and cleans up BOTH private and public caches.
+ * @param {string} newKeyId - The new ID (usually a timestamp or UUID).
  */
 const rotateSigningKey = async (newKeyId) => {
   const oldKeyId = CURRENT_KEY_ID;
 
-  // 1. Mark old key for expiration
   const oldEntry = M2M_SIGNING_KEYS_ACTIVE.get(oldKeyId);
   if (oldEntry) {
     oldEntry.expires = Date.now() + ROTATION_GRACE_PERIOD_MS;
   }
 
-  // 2. Generate and set the NEW current key
   await fetchSigningKeyPair(newKeyId);
   CURRENT_KEY_ID = newKeyId;
 
-  // 3. Cleanup Task: Remove expired private keys from memory
+  // ⭐ CRITICAL FIX: Clean up both sides of the pair to prevent memory leaks
   setTimeout(() => {
     M2M_SIGNING_KEYS_ACTIVE.delete(oldKeyId);
-    Logger.info("M2M_OLD_PRIVATE_KEY_PURGED", { oldKeyId });
-  }, ROTATION_GRACE_PERIOD_MS);
+    M2M_PUBLIC_KEYS_CACHE.delete(oldKeyId); // Don't leave old public keys in RAM forever
+    Logger.info("M2M_KEY_PAIR_PURGED", { oldKeyId });
+  }, ROTATION_GRACE_PERIOD_MS + 5000); // 5s extra buffer
 
-  Logger.alert("M2M_KEY_ROTATION_STARTED", { oldKeyId, newKeyId });
+  Logger.warn("M2M_KEY_ROTATION_COMPLETED", { oldKeyId, newKeyId });
 };
 
 /**
- * @desc ⭐ POINT 3 IMPLEMENTED: Tracing & Metrics
+ * @desc Issues a signed JWT for M2M communication.
  */
 const getM2mToken = async (clientId, clientSecret) => {
   return Tracing.withSpan("m2m.getM2mToken", async (span) => {
-    await initialize();
+    if (M2M_SIGNING_KEYS_ACTIVE.size === 0) await fetchSigningKeyPair(CURRENT_KEY_ID);
+    
     const clientInfo = M2M_CLIENT_STORE[clientId];
 
     if (!clientInfo || clientInfo.secret !== clientSecret) {
@@ -111,6 +103,7 @@ const getM2mToken = async (clientId, clientSecret) => {
       type: "m2m",
     };
 
+    // Use the CURRENT key for signing
     const token = jwt.sign(
       payload,
       M2M_SIGNING_KEYS_ACTIVE.get(CURRENT_KEY_ID).key,
@@ -127,16 +120,24 @@ const getM2mToken = async (clientId, clientSecret) => {
   });
 };
 
+/**
+ * @desc Validates the token against the public key cache.
+ */
 const validateM2mToken = async (authHeader) => {
   return Tracing.withSpan("m2m.validateToken", async (span) => {
     try {
-      const m2mToken = authHeader.replace("Bearer ", "");
-      const decodedHeader = jwt.decode(m2mToken, { complete: true })?.header;
+      if (!authHeader?.startsWith("Bearer ")) throw new UnauthorizedError("Malformed Header.");
+      
+      const m2mToken = authHeader.split(" ")[1];
+      const decoded = jwt.decode(m2mToken, { complete: true });
+      
+      if (!decoded?.header?.kid) throw new UnauthorizedError("JWT missing kid.");
 
-      if (!decodedHeader?.kid) throw new UnauthorizedError("JWT missing kid.");
-
-      const publicKey = M2M_PUBLIC_KEYS_CACHE.get(decodedHeader.kid);
-      if (!publicKey) throw new UnauthorizedError("Public key not found.");
+      const publicKey = M2M_PUBLIC_KEYS_CACHE.get(decoded.header.kid);
+      if (!publicKey) {
+        // Option: In a cluster, if not in RAM, try fetching from Redis/DB here
+        throw new UnauthorizedError("Key version expired or invalid.");
+      }
 
       const payload = jwt.verify(m2mToken, publicKey, {
         algorithms: ["RS256"],
@@ -144,36 +145,33 @@ const validateM2mToken = async (authHeader) => {
         issuer: EXPECTED_ISSUER,
       });
 
-      // Panic Button Check
+      // Versioning (The Panic Button)
       const clientInfo = M2M_CLIENT_STORE[payload.sub];
       if (clientInfo && payload.version < clientInfo.securityVersion) {
-        throw new UnauthorizedError("M2M token revoked by security version.");
+        throw new UnauthorizedError("M2M token version revoked.");
       }
 
       return payload;
     } catch (error) {
-      Metrics.increment("m2m.validation.fail", 1, { error: error.name });
+      span.recordError(error);
+      Metrics.increment("m2m.validation.fail", 1, { type: error.name });
       throw new UnauthorizedError(`M2M Denied: ${error.message}`);
     }
   });
 };
 
 /**
- * @desc ⭐ POINT 2 IMPLEMENTED: Wildcard Scope Hierarchy
+ * @desc Wildcard Scope Validation (e.g., 'user:*' grants 'user:read')
  */
 const checkScopes = (payload, requiredScopes) => {
   const granted = payload.scopes || [];
-  const required = Array.isArray(requiredScopes)
-    ? requiredScopes
-    : [requiredScopes];
+  const required = Array.isArray(requiredScopes) ? requiredScopes : [requiredScopes];
 
   const hasAccess = required.every((req) =>
     granted.some((grant) => {
-      if (grant === req) return true; // Exact match
+      if (grant === req) return true; 
       if (grant.endsWith(":*")) {
-        // Wildcard match
-        const prefix = grant.slice(0, -2);
-        return req.startsWith(prefix);
+        return req.startsWith(grant.slice(0, -2));
       }
       return false;
     })
@@ -184,7 +182,6 @@ const checkScopes = (payload, requiredScopes) => {
 };
 
 module.exports = {
-  initialize,
   getM2mToken,
   validateM2mToken,
   checkScopes,

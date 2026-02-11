@@ -1,45 +1,62 @@
-// services/geoip/maxMindReader.js
 const maxmind = require("maxmind");
 const fs = require("fs");
 const path = require("path");
-const InternalServerError = require("../errors/internal-server-error");
+const Logger = require("../utils/logger");
+const { InternalServerError } = require("../errors/internalServerError");
 
-const GEOIP_DB_PATH = process.env.GEOIP_DB_PATH || path.join(__dirname, "..", "data", "GeoLite2-City.mmdb");
+const GEOIP_DB_PATH = process.env.GEOIP_DB_PATH || path.join(__dirname, "../../data/GeoLite2-City.mmdb");
 
 let reader = null;
 
-function initializeReader() {
-  if (reader) return;
-  if (!fs.existsSync(GEOIP_DB_PATH)) {
-    console.error(`[GeoIP] CRITICAL: DB missing at ${GEOIP_DB_PATH}`);
-    throw new InternalServerError("GeoIP DB missing");
+async function initializeReader() {
+  try {
+    if (reader) return reader;
+
+    if (!fs.existsSync(GEOIP_DB_PATH)) {
+      Logger.error(`[GeoIP] CRITICAL: DB missing at ${GEOIP_DB_PATH}`);
+      throw new InternalServerError("GeoIP Database file not found");
+    }
+
+    // Load into memory and watch for binary swaps
+    reader = await maxmind.open(GEOIP_DB_PATH, { watchForUpdates: true });
+    
+    Logger.info(`[GeoIP] MaxMind DB loaded and watching for updates: ${GEOIP_DB_PATH}`);
+    return reader;
+  } catch (error) {
+    Logger.error(`[GeoIP] Initialization Failed`, { error: error.message });
+    throw error;
   }
-  reader = maxmind.openSync(GEOIP_DB_PATH);
-  console.log(`[GeoIP] MaxMind DB loaded: ${GEOIP_DB_PATH}`);
 }
 
-// Initialize immediately to fail-fast in boot
-initializeReader();
-
-function lookupSync(ip) {
-  if (!reader) throw new InternalServerError("GeoIP Reader not initialized");
-  // maxmind returns undefined for local/private addresses
-  const raw = reader.get(ip);
+/**
+ * Internal transformation logic
+ */
+function transform(raw) {
   if (!raw) return null;
-  const location = raw.location || {};
-  const city = raw.city || {};
-  const country = raw.country || {};
   return {
-    latitude: location.latitude,
-    longitude: location.longitude,
-    city_name: city.names ? city.names.en : undefined,
-    country_name: country.names ? country.names.en : undefined,
-    country_iso: country.iso_code || undefined,
-    time_zone: location.time_zone,
+    latitude: raw.location?.latitude,
+    longitude: raw.location?.longitude,
+    city_name: raw.city?.names?.en,
+    country_name: raw.country?.names?.en,
+    country_iso: raw.country?.iso_code,
+    time_zone: raw.location?.time_zone,
   };
+}
+
+// Synchronous lookup (for high-performance loops)
+function lookupSync(ip) {
+  if (!reader) return null; // Or throw if you prefer strictness
+  return transform(reader.get(ip));
+}
+
+// Asynchronous lookup (matches your current client usage)
+async function lookup(ip) {
+  if (!reader) await initializeReader();
+  return transform(reader.get(ip));
 }
 
 module.exports = {
   initializeReader,
-  lookupSync,
+  lookup,
+  lookupSync, // Now geoIpService.js will find this!
 };

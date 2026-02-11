@@ -9,17 +9,18 @@ const { promisify } = require("util");
 const scrypt = promisify(crypto.scrypt);
 
 const mfaTokenStore = require("./redisMfaStore");
-const Outbox = require("../models/Outbox");
+const Outbox = require("../model/outbox");
 const Tracing = require("../utils/tracingClient");
 const Metrics = require("../utils/metricsClient");
 const Logger = require("../utils/logger");
 // Import the breaker from your authService or breaker config
 const { emailDispatchBreaker } = require("./authService");
-const InternalServerError = require("../errors/internal-server-error");
+const {InternalServerError} = require("../errors/internalServerError");
 const UnauthorizedError = require("../errors/unauthenication-error");
 const BadRequestError = require("../errors/bad-request-error");
-const TooManyRequestError = require("../errors/bad-request-error");
-
+const TooManyRequestError = require("../errors/tooManyRequestError");
+const geoIpService = require("../services/geoIpService");
+const { calculateDistanceKm } = require("../utils/geoMath");
 const CFG = {
   TTL_SEC: 300, // 5 Minutes
   MAX_ATTEMPTS: 3, // Strict lockout threshold
@@ -30,18 +31,65 @@ const CFG = {
   NONCE_SIZE_ABSOLUTE: 64,
 };
 
+
 /**
  * RESOLVE POLICY
- * Private helper to determine hashing cost based on risk factors
+ * Private helper to determine hashing cost based on risk factors.
+ * Now fully integrated with the Enterprise GeoIP Risk Engine.
  */
-function resolvePolicy(userContext) {
-  const { isPrivileged, riskScore, isNewDevice } = userContext;
+async function resolvePolicy(userContext, currentIp) {
+  const { isPrivileged, riskScore, isNewDevice, lastLoginGeo, lastLoginAt, userId } = userContext;
 
-  // High Risk: Admin roles, score >= 70, or unrecognized device
+  // 1. ELITE LEVEL CHECK: Immediate Promotion
+  // If user is admin/superadmin or already has a massive risk score from elsewhere.
   if (isPrivileged || riskScore >= 70 || isNewDevice) {
-    return "ABSOLUTE"; // Memory-hard hashing (Slow/Expensive)
+    return "ABSOLUTE";
   }
-  return "ZENITH"; // Standard fast hashing (Normal)
+
+  // 2. ENTERPRISE RISK ASSESSMENT
+  try {
+    // We delegate the "Impossible Travel" and "Country Blocking" logic
+    // to the dedicated GeoIP Risk Engine.
+    const riskResult = await geoIpService.evaluateLoginRisk({
+      userId,
+      ip: currentIp,
+      lastKnownLocation: lastLoginGeo, // Expected to have latitude/longitude
+      thresholds: {
+        impossibleTravelKm: 800, // Customize thresholds if needed
+        challengeScoreThreshold: 40
+      }
+    });
+
+    // 💡 INTEGRATION LOGIC:
+    // If the Risk Engine blocks the country, we don't just upgrade to ABSOLUTE,
+    // we throw a hard error immediately.
+    if (riskResult.action === "block") {
+      throw new AuthenticationError("Access denied from this location.");
+    }
+
+    // 💡 UPGRADE LOGIC:
+    // If the risk engine suggests a 'challenge' (due to fast travel or suspicious UA),
+    // we promote the hashing policy to ABSOLUTE (Memory-Hard Scrypt).
+    if (riskResult.action === "challenge" || riskResult.score >= 40) {
+      Logger.info("MFA_POLICY_UPGRADED_TO_ABSOLUTE", { 
+        userId, 
+        reason: riskResult.reasons.join(", "),
+        score: riskResult.score 
+      });
+      return "ABSOLUTE";
+    }
+
+  } catch (err) {
+    // 💡 FAIL-SAFE: 
+    // If the GeoIP Service is down or Redis fails, we default to ZENITH 
+    // to ensure high availability for the login flow.
+    Logger.error("RISK_ENGINE_COMMUNICATION_FAILURE", { 
+      userId, 
+      error: err.message 
+    });
+  }
+
+  return "ZENITH";
 }
 
 /**
@@ -64,7 +112,7 @@ exports.initiateMfa = async (userContext, reqContext = {}) => {
     const { userId, email } = userContext;
     const { session, traceId, ip } = reqContext;
 
-    const mode = resolvePolicy(userContext);
+const mode = await resolvePolicy(userContext, ip);
 
     // 1. NONCE & CODE GENERATION
     const nonce = crypto

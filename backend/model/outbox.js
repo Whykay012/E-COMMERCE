@@ -121,4 +121,6 @@ OutboxSchema.statics.claimTask = async function(workerId, lockDurationMs = 30000
     );
 };
 
-module.exports = mongoose.model('Outbox', OutboxSchema);
+const Outbox = mongoose.models.Outbox || mongoose.model('Outbox', OutboxSchema);
+
+module.exports = Outbox;

@@ -1,58 +1,42 @@
-// services/passwordHistoryService.js
+"use strict";
 
-/* ===========================
- * 📦 Dependencies (Models, Utils, Config)
- * =========================== */
+/**
+ * COSMOS HYPER-FABRIC: Password History Service
+ * ---------------------------------------------
+ * Manages credential hygiene by preventing password reuse and enforcing 
+ * historical rotation policies across different user roles.
+ */
+
 const bcrypt = require("bcryptjs");
-const PasswordHistory = require("../model/PasswordHistoryModel");
+const PasswordHistory = require("../model/passwordHistory");
 const User = require("../model/userModel");
 const BadRequestError = require("../errors/bad-request-error");
 const auditLogger = require("./auditLogger");
-const securityPolicy = require("../utils/securityPolicyUtils"); // 💡 UPGRADE 1: Centralized, cross-service policy fetching
+const securityPolicy = require("../utils/securityPolicyUtils"); 
 const pLimit = require("p-limit");
 
-// 💡 Concurrency Semaphore for CPU-intensive bcrypt comparisons
-// Limits the number of simultaneous comparison promises to prevent event loop starvation.
+// 💡 Concurrency Semaphore: Prevents CPU spikes during mass bcrypt comparisons
 const COMPARISON_CONCURRENCY_LIMIT = 5;
 const compareLimit = pLimit(COMPARISON_CONCURRENCY_LIMIT);
-
-//
-
-/* ===========================
- * 🔒 SECURITY LOGIC (Apex Optimisation)
- * =========================== */
 
 /**
  * Checks if the new password has been used recently or matches the current password.
  * Uses bounded concurrency for hash comparisons to manage CPU load.
- * * @param {string} userId - ID of the user.
+ * * @param {string} userId - ID of the user (MongoDB ObjectId).
  * @param {string} newPassword - The clear-text new password provided by the user.
- * @param {object} context - Optional: { traceId } for better logging.
+ * @param {Object} [context={}] - Optional: { traceId } for audit trail continuity.
  * @throws {BadRequestError} If the password is found in history or matches current.
+ * @returns {Promise<void>}
  */
 exports.checkPasswordHistory = async (userId, newPassword, context = {}) => {
-  // Fetch policy dynamically
-  const MAX_HISTORY_COUNT = securityPolicy.getMaxPasswordHistoryCount(
-    user.role
-  );
-
   if (!newPassword) {
     throw new BadRequestError("New password cannot be empty.");
   }
 
-  // 1. Fetch current hash and historical hashes concurrently (DB reads are fast)
-  const [user, history] = await Promise.all([
-    User.findById(userId).select("password").lean(),
-    PasswordHistory.find({ user: userId })
-      .sort({ createdAt: -1 })
-      .limit(MAX_HISTORY_COUNT)
-      .select("passwordHash")
-      .lean(),
-  ]);
+  // 1. Fetch current hash and role (Role is required to fetch correct security policy)
+  const user = await User.findById(userId).select("password role").lean();
 
   if (!user || !user.password) {
-    // Log a high-severity event for a missing user record
-    // 🎯 FIXED: Removed 'await'
     auditLogger.dispatchLog({
       level: "ERROR",
       event: "PASSWORD_CHECK_FAILED",
@@ -63,7 +47,17 @@ exports.checkPasswordHistory = async (userId, newPassword, context = {}) => {
     throw new BadRequestError("Invalid user operation.");
   }
 
-  // 2. Prepare all hash comparison tasks using the bounded concurrency limiter
+  // 2. Fetch policy dynamically based on user role (e.g., Admin might have higher history count)
+  const MAX_HISTORY_COUNT = securityPolicy.getMaxPasswordHistoryCount(user.role);
+
+  // 3. Fetch historical hashes (DB reads are fast)
+  const history = await PasswordHistory.find({ user: userId })
+    .sort({ createdAt: -1 })
+    .limit(MAX_HISTORY_COUNT)
+    .select("passwordHash")
+    .lean();
+
+  // 4. Prepare comparison tasks using the bounded concurrency limiter
   const comparisonTasks = [];
 
   // Task A: Check against current password
@@ -88,11 +82,10 @@ exports.checkPasswordHistory = async (userId, newPassword, context = {}) => {
     );
   });
 
-  // 3. Execute all comparisons (The limiter protects the event loop from being blocked by too many CPU tasks)
+  // 5. Execute all comparisons (Limiter protects the Event Loop)
   const results = await Promise.all(comparisonTasks);
-  //
 
-  // 4. Analyze results (Fail-fast principle)
+  // 6. Analyze results (Fail-fast principle)
   for (const result of results) {
     if (result.isMatch) {
       const message =
@@ -100,7 +93,6 @@ exports.checkPasswordHistory = async (userId, newPassword, context = {}) => {
           ? "New password must be different from your current password."
           : `This password was used recently. You cannot reuse any of your last ${MAX_HISTORY_COUNT} passwords.`;
 
-      // 🎯 FIXED: Removed 'await'
       auditLogger.dispatchLog({
         level: "WARN",
         event: "PASSWORD_REUSE_BLOCKED",
@@ -112,51 +104,41 @@ exports.checkPasswordHistory = async (userId, newPassword, context = {}) => {
     }
   }
 
-  // Success: Password is new
+  // Success: Password is clean
 };
 
 /**
- * Saves the new password hash to the history collection and enforces the history limit.
- * NOTE: Assumes the authService passes the HASH, avoiding re-hashing the clear-text password.
+ * Saves the new password hash to history and triggers cleanup.
  * * @param {string} userId - ID of the user.
- * @param {string} newPasswordHash - The new password hash (output from authService/bcrypt).
- * @param {object} context - Optional: { traceId } for better logging.
+ * @param {string} newPasswordHash - The pre-hashed new password.
+ * @param {Object} [context={}] - Optional tracing metadata.
+ * @returns {Promise<void>}
  */
 exports.saveNewPasswordHash = async (userId, newPasswordHash, context = {}) => {
-  // Fetch policy dynamically
-  const MAX_HISTORY_COUNT = securityPolicy.getMaxPasswordHistoryCount();
-
   try {
-    // 1. Save the new hash to history (Fast, single DB write)
+    // Determine policy for cleanup
+    const user = await User.findById(userId).select("role").lean();
+    const MAX_HISTORY_COUNT = securityPolicy.getMaxPasswordHistoryCount(user?.role || 'user');
+
+    // 1. Save new hash
     await PasswordHistory.create({
       user: userId,
       passwordHash: newPasswordHash,
       createdAt: new Date(),
     });
 
-    // 2. Enforce limit (Cleanup old history records - fire-and-forget, non-blocking)
-    this.enforceHistoryLimit(userId, MAX_HISTORY_COUNT, context).catch(
-      (err) => {
-        console.error(
-          `[CRITICAL] Async history cleanup failed for user ${userId}:`,
-          err
-        );
-        // 🎯 FIXED: Removed 'await'
-        auditLogger.dispatchLog({
-          level: "ERROR",
-          event: "HISTORY_CLEANUP_FAIL",
-          userId,
-          details: `Error cleaning history: ${err.message}`,
-          traceId: context.traceId,
-        });
-      }
-    );
+    // 2. Enforce limit (Non-blocking cleanup)
+    this.enforceHistoryLimit(userId, MAX_HISTORY_COUNT, context).catch((err) => {
+      auditLogger.dispatchLog({
+        level: "ERROR",
+        event: "HISTORY_CLEANUP_FAIL",
+        userId,
+        details: `Async cleanup failed: ${err.message}`,
+        traceId: context.traceId,
+      });
+    });
+
   } catch (error) {
-    console.error(
-      `[CRITICAL] Error saving password hash to history for user ${userId}:`,
-      error
-    );
-    // 🎯 FIXED: Removed 'await'
     auditLogger.dispatchLog({
       level: "CRITICAL",
       event: "PASSWORD_HISTORY_FAIL",
@@ -168,31 +150,24 @@ exports.saveNewPasswordHash = async (userId, newPasswordHash, context = {}) => {
 };
 
 /**
- * Internal function to clean up older password history records beyond the limit.
- * Efficiently uses MongoDB query optimisations.
- * @param {string} userId - ID of the user.
- * @param {number} maxCount - The maximum number of records to keep.
- * @param {object} context - Optional: { traceId }
+ * Internally cleans up older password history records beyond the allowed limit.
+ * * @param {string} userId - ID of the user.
+ * @param {number} maxCount - The maximum number of records to retain.
+ * @param {Object} [context={}] - Optional tracing metadata.
+ * @returns {Promise<void>}
  */
 exports.enforceHistoryLimit = async (userId, maxCount, context = {}) => {
-  // Find the oldest record that should be kept (the MAX_HISTORY_COUNT-th newest record)
-  const recordToKeep = await PasswordHistory.find({ user: userId })
+  // Identify records that exceed the 'maxCount' window
+  const recordsToPrune = await PasswordHistory.find({ user: userId })
     .sort({ createdAt: -1 })
     .skip(maxCount)
-    .limit(1)
-    .select("createdAt")
+    .select("_id")
     .lean();
 
-  if (recordToKeep.length > 0) {
-    const cutOffDate = recordToKeep[0].createdAt;
+  if (recordsToPrune.length > 0) {
+    const idsToDelete = recordsToPrune.map(rec => rec._id);
+    const result = await PasswordHistory.deleteMany({ _id: { $in: idsToDelete } });
 
-    // Delete all records older than or equal to the cutOffDate in one query
-    const result = await PasswordHistory.deleteMany({
-      user: userId,
-      createdAt: { $lte: cutOffDate },
-    });
-
-    // 🎯 FIXED: Removed 'await'
     auditLogger.dispatchLog({
       level: "DEBUG",
       event: "PASSWORD_HISTORY_CLEANUP",

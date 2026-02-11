@@ -1,7 +1,8 @@
 // utils/otelExporter.js (ADVANCED OTLP EXPORTER STUB: Simulating Resilience)
 
 const Logger = require('./logger'); 
-const { diag, DiagLogLevel } = require('@opentelemetry/api');
+// Replace your existing @opentelemetry/api import with this:
+const { diag, DiagConsoleLogger, DiagLogLevel } = require('@opentelemetry/api');
 
 // --- Configuration ---
 const MAX_EXPORT_RETRIES = 3;

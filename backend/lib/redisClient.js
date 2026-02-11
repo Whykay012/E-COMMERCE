@@ -1,327 +1,300 @@
-/**
- * utils/redisClient.js
- * COSMOS HYPER-FABRIC OMEGA: Streams-Based DLQ & Centralized Health Checks
- * * Includes:
- * 1. Automatic Hash-Tagging for Cluster Sharding (ReplayGuard Compatibility).
- * 2. Multi-Worker Redis Streams DLQ logic.
- * 3. Redlock Distributed Locking & Dedicated Pub/Sub Subscriber.
- */
-
-const Redis = require("ioredis");
-const Redlock = require("redlock");
-const fs = require("fs");
-const path = require("path");
-const logger = require("../utils/logger");
-
-const { getRedisConnectionDetails } = require("../config/redisConnection");
-const { REDIS_NODES } = require("../config/redisNodes");
-
-// --- Configuration ---
-const DLQ_STREAM_KEY = "dlq:stream:jobs";
-const DLQ_CONSUMER_GROUP = "dlq_processors";
-const DLQ_WORKER_NAME = `dlq_worker_${Math.random()
-  .toString(36)
-  .substring(2, 8)}`;
-const MAX_DLQ_RETRIES = 5;
-const BLOCK_TIMEOUT_MS = 2000;
-
-// ---------------------------------------------------
-// 1. Core Redis Clients and Services
-// ---------------------------------------------------
-
-let redisCluster;
-let redlock;
-let subscriber;
+"use strict";
 
 /**
- * @desc Establishes connection to the Redis Cluster.
- * @returns {Redis.Cluster} The main Redis client.
+ * TITAN NEXUS: Concurrency-Safe Checkout Service
+ * ---------------------------------------------
+ * Integration: COSMOS HYPER-FABRIC OMEGA (Redis Cluster + Redlock)
+ * Features: Optimistic Redis Stock Reservation, MongoDB Transactional Outbox, 
+ * Idempotency Guards, and Cluster-Aware Pipeline Sharding.
  */
-function connectRedis() {
-  if (redisCluster) return redisCluster;
 
-  redisCluster = new Redis.Cluster(REDIS_NODES, {
-    redisOptions: {
-      ...getRedisConnectionDetails(),
-      enableReadyCheck: true,
-      maxRetriesPerRequest: 3,
-      connectTimeout: 10000,
-    },
-  });
+const mongoose = require("mongoose");
+const Cart = require("../model/cart");
+const Order = require("../model/order");
+const Product = require("../model/product");
+const Payment = require("../model/payment");
+const User = require("../model/userModel");
+const IdempotencyKey = require("../model/idempotencyKey");
+const Address = require("../model/addressModel");
+const PaymentService = require("./paymentServices");
 
-  redisCluster.on("ready", () => {
-    logger.info("Redis Cluster READY");
+// --- 🚨 Standardized Custom Errors ---
+const BadRequestError = require("../errors/bad-requesr-error"); 
+const NotFoundError = require("../errors/notFoundErrror"); 
+const ConflictError = require("../errors/conflictError"); 
+const ConcurrencyError = require("../errors/concurrencyError"); 
 
-    /**
-     * ======================================
-     * Lua Replay Guard (Atomic Security)
-     * ======================================
-     * Registered ONCE per process. Safe for Redis Cluster.
-     */
-    try {
-      const replayLuaPath = path.join(__dirname, "../lua/replayGuard.lua");
-      if (fs.existsSync(replayLuaPath)) {
-        const replayLua = fs.readFileSync(replayLuaPath, "utf8");
+// --- 🚀 OMEGA Job Queue & Redis ---
+const { queueJob, GENERAL_QUEUE_NAME } = require("../queue/jobQueue");
+const { getRedisClient } = require("../utils/redisClient"); // 💡 OMEGA CLIENT
+const logger = require("../config/logger");
 
-        // Register custom command
-        redisCluster.defineCommand("replayGuardRaw", {
-          numberOfKeys: 2,
-          lua: replayLua,
-        });
+const DEFAULTS = {
+  TAX_RATE: 0.075,
+  SHIPPING_FLAT: 500,
+  CURRENCY: "NGN",
+};
 
-        /**
-         * 🛰️ CLUSTER SHARDING WRAPPER
-         * Automatically ensures keys land on the same node using hash tags {}
-         */
-        redisCluster.replayGuard = async (key1, key2, ...args) => {
-          // Extract an identifier (e.g., userId) to create a shared hash slot
-          // If keys already contain {}, we use them; otherwise, we wrap the keys.
-          const taggedKey1 = key1.includes("{") ? key1 : `{${key1}}`;
-          const taggedKey2 = key2.includes("{") ? key2 : `{${key1}}:ban`;
+/**
+ * @desc Ensures Redis Cluster sharding consistency using hash-tags.
+ * All operations for a specific product will hit the same shard.
+ */
+const getProductStockKey = (productId) => `product:{stock}:${productId}`;
 
-          return redisCluster.replayGuardRaw(taggedKey1, taggedKey2, ...args);
+const CheckoutService = {
+
+  /**
+   * Calculates financial breakdown for items.
+   */
+  calcTotals(items = []) {
+    const subtotal = items.reduce((sum, it) => {
+      const price = Number(it.price || 0);
+      const qty = Number(it.quantity || 1);
+      const discount = Number(it.discount || 0);
+      return sum + Math.max(0, price * qty - discount);
+    }, 0);
+
+    const tax = Math.round(subtotal * DEFAULTS.TAX_RATE);
+    const shipping = subtotal > 5000 ? 0 : DEFAULTS.SHIPPING_FLAT;
+    const grandTotal = subtotal + tax + shipping;
+
+    return { subtotal, tax, shipping, grandTotal, currency: DEFAULTS.CURRENCY };
+  },
+
+  /**
+   * Validates cart existence and product stock availability.
+   */
+  async validateCartAndGetItems(userId) {
+    const cart = await Cart.findOne({ user: userId }).populate("items.product").lean();
+    if (!cart || !Array.isArray(cart.items) || cart.items.length === 0)
+      throw new BadRequestError("Your cart is empty");
+
+    const itemsDetailed = [];
+    for (const it of cart.items) {
+      const product = it.product;
+      if (!product) {
+        logger.error("Product not found during cart validation.", { userId: userId.toString(), productId: it.product });
+        throw new NotFoundError(`Product not found: ${it.product}`);
+      }
+      const qty = Number(it.quantity || 1);
+      
+      if (product.stock !== undefined && product.stock < qty)
+        throw new BadRequestError(
+          `Insufficient stock for product "${product.name}". Only ${product.stock} available.`
+        );
+
+      itemsDetailed.push({
+        productId: product._id,
+        name: product.name,
+        price: product.price,
+        quantity: qty,
+        discount: it.discount || 0,
+        selectedColor: it.selectedColor,
+        selectedSize: it.selectedSize,
+        image: product.images?.[0]?.url || product.images?.[0] || "",
+      });
+    }
+
+    return { cart, itemsDetailed };
+  },
+
+  /**
+   * Core Transactional Logic: Optimistic Stock + DB Transaction
+   */
+  async createOrderAndMaybeInitPayment(opts = {}) {
+    let email = opts.email; 
+    const {
+      userId,
+      paymentMethod = "online",
+      addressId,
+      currency = DEFAULTS.CURRENCY,
+      metadata = {},
+      idempotencyKey = null,
+    } = opts;
+
+    if (!userId) throw new BadRequestError("Missing user");
+
+    // 1. 🔑 IDEMPOTENCY CHECK
+    if (idempotencyKey) {
+      const existingIdempotency = await IdempotencyKey.findOne({ key: idempotencyKey });
+      if (existingIdempotency && existingIdempotency.status === 'success') {
+        logger.audit("IDEMPOTENCY_HIT_SUCCESS", { userId: userId.toString(), idempotencyKey });
+        
+        const orderDoc = await Order.findById(existingIdempotency.response.orderId)
+          .populate("items.product", "name images price").lean();
+        
+        return { 
+          status: 'idempotent-success', 
+          order: orderDoc, 
+          paymentInit: existingIdempotency.response.paymentInit || null 
         };
+      }
+    }
 
-        logger.info(
-          "Redis Lua command 'replayGuard' registered with Cluster-Aware wrapping"
+    // 2. Data Preparation
+    const { cart, itemsDetailed } = await this.validateCartAndGetItems(userId);
+    const { subtotal, tax, shipping, grandTotal } = this.calcTotals(itemsDetailed);
+    
+    const addressDoc = await Address.findOne({ _id: addressId, user: userId }).lean();
+    if (!addressDoc) throw new NotFoundError("Shipping address not found.");
+    const shippingAddress = addressDoc;
+
+    // 3. ⚡ OMEGA OPTIMISTIC STOCK RESERVATION
+    const redis = getRedisClient();
+    let redisReserved = false;
+
+    if (redis && redis.status === 'ready') {
+      try {
+        const pipeline = redis.pipeline();
+        itemsDetailed.forEach(it => pipeline.decrby(getProductStockKey(it.productId), it.quantity));
+        
+        const results = await pipeline.exec();
+        const failedItemIndex = results.findIndex(res => res[0] || res[1] < 0);
+
+        if (failedItemIndex !== -1) {
+          // Atomic Rollback for Cluster Shard
+          const rollbackPipeline = redis.pipeline();
+          for (let i = 0; i <= failedItemIndex; i++) {
+            if (!results[i][0]) {
+              rollbackPipeline.incrby(getProductStockKey(itemsDetailed[i].productId), itemsDetailed[i].quantity);
+            }
+          }
+          await rollbackPipeline.exec();
+          throw new ConcurrencyError(`Stock exhausted for item: ${itemsDetailed[failedItemIndex].name}`);
+        }
+        redisReserved = true;
+      } catch (redisErr) {
+        if (redisErr instanceof ConcurrencyError) throw redisErr;
+        logger.error("Redis Stock Check Failed - Degrading to DB-only", { error: redisErr.message });
+      }
+    }
+
+    // 4. MONGODB TRANSACTION (The Source of Truth)
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+      if (idempotencyKey) {
+        await IdempotencyKey.findOneAndUpdate(
+          { key: idempotencyKey },
+          { status: 'processing', userId, requestBody: opts },
+          { upsert: true, session }
         );
       }
-    } catch (err) {
-      logger.error(
-        { err: err.message },
-        "Failed to load replayGuard Lua script"
-      );
-    }
-  });
 
-  redisCluster.on("error", (err) =>
-    logger.error({ err }, "Redis Cluster error")
-  );
+      const orderPayload = {
+        user: userId, items: itemsDetailed, subtotal, tax, shipping, 
+        totalAmount: grandTotal, currency, address: shippingAddress,
+        status: (paymentMethod === 'wallet' || paymentMethod === 'cod') ? "processing" : "pending",
+        paymentStatus: paymentMethod === 'wallet' ? "paid" : "pending",
+        events: [{ label: "Order created via Nexus Checkout", date: new Date() }],
+      };
 
-  return redisCluster;
-}
+      const [orderDoc] = await Order.create([orderPayload], { session });
 
-/**
- * @desc Initializes Redlock for multi-node distributed locking.
- */
-function initializeRedlock() {
-  if (redlock) return redlock;
-  const clients = [redisCluster || connectRedis()];
+      // Atomic Mongo Stock Check
+      const bulkOps = itemsDetailed.map((it) => ({
+        updateOne: {
+          filter: { _id: it.productId, stock: { $gte: it.quantity } },
+          update: { $inc: { stock: -it.quantity, sold: it.quantity } },
+        },
+      }));
 
-  redlock = new Redlock(clients, {
-    driftFactor: 0.01,
-    retryCount: 6,
-    retryDelay: 200,
-    retryJitter: 100,
-  });
-
-  redlock.on("clientError", (err) =>
-    logger.error({ err }, "Redlock client error")
-  );
-  logger.info("Redlock initialized and attached to Cluster");
-  return redlock;
-}
-
-/**
- * @desc Creates and subscribes the dedicated Pub/Sub client.
- */
-function initializeCacheSubscriber() {
-  if (subscriber) return subscriber;
-
-  subscriber = new Redis.Cluster(REDIS_NODES, {
-    redisOptions: getRedisConnectionDetails(),
-  });
-
-  const CACHE_CHANNEL = "cache:invalidate";
-
-  subscriber.subscribe(CACHE_CHANNEL, (err) => {
-    if (err) logger.error({ err }, `Subscription to ${CACHE_CHANNEL} failed`);
-    else logger.info(`Subscribed to channel: ${CACHE_CHANNEL}`);
-  });
-
-  subscriber.on("message", async (channel, key) => {
-    if (channel === CACHE_CHANNEL) {
-      try {
-        await redisCluster.del(key);
-        logger.info({ key }, "L2 Cache invalidated via Pub/Sub");
-      } catch (err) {
-        logger.error({ err, key }, "Failed to process cache invalidation");
+      const bulkResult = await Product.bulkWrite(bulkOps, { session });
+      if (bulkResult.modifiedCount !== bulkOps.length) {
+        throw new ConcurrencyError("MongoDB stock consistency check failed.");
       }
-    }
-  });
 
-  return subscriber;
-}
+      await Cart.updateOne({ _id: cart._id }, { $set: { items: [] } }, { session });
 
-/**
- * @desc Graceful disconnection.
- */
-async function disconnectRedis() {
-  logger.info("Disconnecting Redis clients...");
-  const closures = [];
-  if (redisCluster) closures.push(redisCluster.quit());
-  if (subscriber) closures.push(subscriber.quit());
+      // Wallet Logic
+      let paymentInit = null;
+      if (paymentMethod === 'wallet') {
+        const user = await User.findOneAndUpdate(
+          { _id: userId, walletBalance: { $gte: grandTotal } },
+          { $inc: { walletBalance: -grandTotal } },
+          { session, new: true }
+        );
+        if (!user) throw new BadRequestError("Insufficient wallet balance.");
 
-  await Promise.allSettled(closures);
-  redisCluster = null;
-  subscriber = null;
-  redlock = null;
-  logger.info("Redis clients disconnected.");
-}
+        const [payment] = await Payment.create([{
+          user: userId, order: orderDoc._id, amount: grandTotal, currency,
+          status: "success", provider: "wallet", reference: `WLT-${orderDoc._id}-${Date.now()}`
+        }], { session });
 
-// ---------------------------------------------------
-// 2. Dead Letter Queue (DLQ) Worker (Redis Streams)
-// ---------------------------------------------------
+        orderDoc.paymentStatus = "paid";
+        orderDoc.reference = payment.reference;
+        orderDoc.payment = payment._id;
+        await orderDoc.save({ session });
+      } else {
+        // Online / COD Placeholder
+        const [payment] = await Payment.create([{
+          user: userId, order: orderDoc._id, amount: grandTotal, currency,
+          status: paymentMethod === 'cod' ? "pending_confirmation" : "pending",
+          provider: paymentMethod === 'cod' ? "cod" : "paystack"
+        }], { session });
+        orderDoc.payment = payment._id;
+        await orderDoc.save({ session });
+      }
 
-async function setupDLQConsumerGroup() {
-  try {
-    await redisCluster.xgroup(
-      "CREATE",
-      DLQ_STREAM_KEY,
-      DLQ_CONSUMER_GROUP,
-      "$",
-      "MKSTREAM"
-    );
-    logger.info(`DLQ Consumer Group '${DLQ_CONSUMER_GROUP}' created`);
-  } catch (err) {
-    if (!err.message.includes("BUSYGROUP")) {
-      logger.error({ err }, "Failed to setup DLQ Consumer Group");
-    }
-  }
-}
+      await session.commitTransaction();
+      session.endSession();
 
-async function startDeadLetterWorker() {
-  if (!redisCluster) connectRedis();
-  await setupDLQConsumerGroup();
+      // 5. POST-COMMIT (Async Outbox)
+      await queueJob(GENERAL_QUEUE_NAME, "order.process", { 
+        orderId: orderDoc._id.toString(), userId: userId.toString() 
+      });
 
-  async function pollStream() {
-    try {
-      await processPendingStreamEntries();
-
-      const response = await redisCluster.xreadgroup(
-        "GROUP",
-        DLQ_CONSUMER_GROUP,
-        DLQ_WORKER_NAME,
-        "BLOCK",
-        BLOCK_TIMEOUT_MS,
-        "COUNT",
-        10,
-        "STREAMS",
-        DLQ_STREAM_KEY,
-        ">"
-      );
-
-      if (response) {
-        const [, messages] = response[0];
-        for (const [id, fields] of messages) {
-          const job = parseStreamMessage(fields);
-          processDlqJob(id, job);
+      // 6. External Payment Initialization
+      if (paymentMethod === "online") {
+        if (!email) {
+          const u = await User.findById(userId).select("email").lean();
+          email = u?.email;
         }
+        paymentInit = await PaymentService.initializePayment(
+          userId, grandTotal, email, currency, { orderId: orderDoc._id.toString(), idempotencyKey }
+        );
+        await Order.findByIdAndUpdate(orderDoc._id, { reference: paymentInit.reference });
+        await Payment.findByIdAndUpdate(orderDoc.payment, { reference: paymentInit.reference });
       }
+
+      if (idempotencyKey) {
+        await IdempotencyKey.updateOne(
+          { key: idempotencyKey },
+          { $set: { status: 'success', response: { orderId: orderDoc._id.toString(), paymentInit } } }
+        );
+      }
+
+      this._emitOrderCreated(userId, orderDoc._id);
+      return { order: orderDoc, paymentInit };
+
     } catch (err) {
-      logger.error({ err }, "DLQ Stream Worker read failure");
+      await session.abortTransaction();
+      session.endSession();
+
+      // Redis Rollback on failure
+      if (redisReserved) {
+        const rbPipeline = redis.pipeline();
+        itemsDetailed.forEach(it => rbPipeline.incrby(getProductStockKey(it.productId), it.quantity));
+        await rbPipeline.exec();
+      }
+
+      if (idempotencyKey) {
+        await IdempotencyKey.updateOne({ key: idempotencyKey }, { status: 'failed', error: err.message });
+      }
+
+      throw (err instanceof ConcurrencyError) ? new BadRequestError(err.message) : err;
     }
-    setImmediate(pollStream);
-  }
+  },
 
-  pollStream();
-  logger.info(`Dead Letter Stream Worker '${DLQ_WORKER_NAME}' active`);
-}
-
-async function processDlqJob(id, payload) {
-  const attempt = (payload.attempt || 0) + 1;
-  payload.attempt = attempt;
-
-  if (attempt > MAX_DLQ_RETRIES) {
-    logger.error({ payload }, "DLQ exceeded max retries");
-    await redisCluster.rpush("dlq:permanent", JSON.stringify(payload));
-    await redisCluster.xack(DLQ_STREAM_KEY, DLQ_CONSUMER_GROUP, id);
-    return;
-  }
-
-  const backoff = Math.pow(2, attempt) * 1000;
-  setTimeout(async () => {
+  _emitOrderCreated(userId, orderId) {
     try {
-      // Logic for job execution would go here
-      await redisCluster.xack(DLQ_STREAM_KEY, DLQ_CONSUMER_GROUP, id);
-      logger.info({ payload }, `DLQ retry succeeded (Attempt ${attempt})`);
-    } catch (err) {
-      logger.error({ err, payload }, "DLQ retry failed");
-    }
-  }, backoff);
-}
-
-async function processPendingStreamEntries() {
-  const result = await redisCluster.xautoclaim(
-    DLQ_STREAM_KEY,
-    DLQ_CONSUMER_GROUP,
-    DLQ_WORKER_NAME,
-    300000,
-    "0-0",
-    "COUNT",
-    10
-  );
-
-  if (result && result[1] && result[1].length > 0) {
-    const messages = result[1];
-    for (const [id, fields] of messages) {
-      const job = parseStreamMessage(fields);
-      processDlqJob(id, job);
-    }
-  }
-}
-
-// ---------------------------------------------------
-// 3. Helpers & Exported Interfaces
-// ---------------------------------------------------
-
-function parseStreamMessage(fields) {
-  const job = {};
-  for (let i = 0; i < fields.length; i += 2) {
-    try {
-      job[fields[i]] = JSON.parse(fields[i + 1]);
+      const io = global?.appInstance?.get("io");
+      if (io) io.to(userId.toString()).emit("orderCreated", { orderId: orderId.toString() });
     } catch (e) {
-      job[fields[i]] = fields[i + 1];
+      logger.error("Socket emit failed", { error: e.message });
     }
   }
-  return job.payload || job;
-}
-
-async function checkHealth() {
-  try {
-    if (!redisCluster) return false;
-    const response = await redisCluster.ping();
-    return response === "PONG";
-  } catch (e) {
-    logger.error({ error: e.message }, "Redis Health Check Failed");
-    return false;
-  }
-}
-
-function getRedisClient() {
-  if (!redisCluster) throw new Error("Redis Cluster not connected.");
-  return redisCluster;
-}
-
-function getRedlock() {
-  if (!redlock) throw new Error("Redlock not initialized.");
-  return redlock;
-}
-
-function getRedisSubscriber() {
-  if (!subscriber) throw new Error("Redis Subscriber not initialized.");
-  return subscriber;
-}
-
-module.exports = {
-  connectRedis,
-  disconnectRedis,
-  initializeRedlock,
-  initializeCacheSubscriber,
-  startDeadLetterWorker,
-  getRedisClient,
-  getRedlock,
-  getRedisSubscriber,
-  checkHealth,
-  Redis,
 };
+
+module.exports = CheckoutService;

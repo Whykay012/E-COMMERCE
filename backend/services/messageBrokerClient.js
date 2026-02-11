@@ -151,24 +151,72 @@ const sendTransactionalMessages = async (topic, messages, transactionId) => {
 };
 
 
+// At the top of messageBrokerClient.js with your other variables
+const activeConsumers = []; // 💡 Track consumers for graceful exit
+
 /**
- * @desc Disconnects the Kafka Producer. Should be called on application shutdown.
+ * @desc Subscribes to a topic and tracks the consumer for lifecycle management.
  */
-const disconnectProducer = async () => {
+const subscribe = async (topic, groupId, onMessage) => {
+    const consumer = kafka.consumer({ groupId });
+    
+    try {
+        await consumer.connect();
+        await consumer.subscribe({ topic, fromBeginning: false });
+
+        await consumer.run({
+            eachMessage: async ({ message }) => {
+                try {
+                    const payload = JSON.parse(message.value.toString());
+                    await onMessage(payload);
+                } catch (parseError) {
+                    logger.error(`[Kafka:Consumer] Failed to parse JSON`, { topic, error: parseError.message });
+                }
+            },
+        });
+
+        activeConsumers.push(consumer); // 💡 Store for shutdown
+        logger.info(`[Kafka] Consumer ${groupId} active on ${topic}`);
+        return consumer;
+    } catch (error) {
+        logger.error(`[Kafka] Subscription failed`, { topic, error: error.message });
+        throw error;
+    }
+};
+
+/**
+ * @desc Full cleanup: Disconnects producer AND all active consumers.
+ */
+const disconnectAll = async () => {
+    logger.info('[Kafka] Initiating full cluster disconnect...');
+    
+    // 1. Clean up Producer
     if (isConnected) {
         try {
             await producer.disconnect();
             isConnected = false;
             logger.info('[Kafka] Producer disconnected.');
-        } catch (error) {
-            logger.error('[Kafka] Error disconnecting producer:', error.message);
+        } catch (err) {
+            logger.error('[Kafka] Producer disconnect error', { error: err.message });
+        }
+    }
+
+    // 2. Clean up Consumers
+    for (const consumer of activeConsumers) {
+        try {
+            await consumer.disconnect();
+            logger.info('[Kafka] Consumer closed safely.');
+        } catch (err) {
+            logger.error('[Kafka] Consumer disconnect error', { error: err.message });
         }
     }
 };
 
+// Update your exports
 module.exports = {
     connectProducer,
     sendMessage,
-    sendTransactionalMessages, // NEW: For Exactly-Once Semantics
-    disconnectProducer,
+    sendTransactionalMessages,
+    subscribe,
+    disconnectProducer: disconnectAll, // 💡 Map old name to new full-cleanup logic
 };

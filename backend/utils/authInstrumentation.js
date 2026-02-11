@@ -3,7 +3,7 @@
  * High-Precision Identity Observability & SIEM-Ready Telemetry.
  */
 const metricsClient = require("./metricsClient");
-const auditLogger = require("./auditLogger");
+const auditLogger = require("../services/auditLogger");
 const tracingClient = require("./tracingClient");
 const Logger = require("./logger");
 const { SemanticAttributes } = require("@opentelemetry/semantic-conventions");

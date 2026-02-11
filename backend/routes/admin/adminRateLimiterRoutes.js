@@ -1,51 +1,103 @@
-// routes/adminRateLimitRoutes.js (COSMOS HYPER-FABRIC - FULLY ACTIVATED SECURITY)
-// Defines the secured routes for the administrative rate limit management API.
+"use strict";
+
+/**
+ * COSMOS HYPER-FABRIC: Unified Security & Rate Limit Management
+ * -----------------------------------------------------------
+ * This router combines automated predictive analytics with manual 
+ * override capabilities (Block/Unblock) for the Redis Cluster.
+ */
 
 const express = require('express');
 const router = express.Router();
 
+// Controllers and Dashboard Services
 const adminRateLimitController = require('../controller/adminRateLimitController');
-// 💡 ACTIVATED: Import the new middleware structure
+const { getBlockedUsers } = require("../services/rateLimiter/rateLimiterDashboard");
+const { getRedisClient } = require("../utils/redisClient");
+
+// 💡 ACTIVATED: Authentication & Authorization
 const { authenticate, authorizePermissions } = require('../middleware/authMiddleware'); 
 
-// --- ROUTER LEVEL MIDDLEWARE ---
+// --- 1. ROUTER LEVEL MIDDLEWARE ---
 
-// Apply administrative rate limiting to all routes in this router
+// Protect the Admin Panel itself from being brute-forced
 router.use(adminRateLimitController.adminRateLimitMiddleware()); 
 
-// 💡 ACTIVATED: Apply authentication to secure all routes
+// Ensure only authenticated Security Engineers/Admins can proceed
 router.use(authenticate);
-
-// 💡 ACTIVATED: Apply high-level authorization (only 'admin' and 'security_engineer' can access)
-const restrictToAdmin = authorizePermissions(['admin', 'security_engineer']);
-router.use(restrictToAdmin); 
-
+router.use(authorizePermissions(['admin', 'security_engineer']));
 
 // =====================================================================
-// 🌐 CORE ADMINISTRATIVE ENDPOINTS (Fully Protected)
+// 🌐 COMMAND & CONTROL: MANUAL OVERRIDES (Manual Block/Unblock)
 // =====================================================================
 
-// 1. GET /keys - List all rate limit keys with status and predictive score
-router.get('/keys', adminRateLimitController.listRateLimitKeys);
+/**
+ * @route   GET /api/admin/ratelimit/security/blocked-users
+ * @desc    Fetch real-time blocklist data for the dashboard
+ */
+router.get("/security/blocked-users", async (req, res) => {
+    try {
+        const data = await getBlockedUsers();
+        res.status(200).json({
+            status: "success",
+            count: data.length,
+            data
+        });
+    } catch (err) {
+        res.status(500).json({ status: "error", message: err.message });
+    }
+});
 
-// 2. DELETE /keys/:key - Clear a single rate limit key
-router.delete('/keys/:key', adminRateLimitController.clearRateLimitKey);
+/**
+ * @route   DELETE /api/admin/ratelimit/security/unblock/:identifier
+ * @desc    Manually remove an identifier (IP/User) from the blocklist
+ */
+router.delete("/security/unblock/:identifier", async (req, res) => {
+    try {
+        const redis = getRedisClient();
+        const { identifier } = req.params;
+        
+        // Remove the specific blocklist key
+        await redis.del(`blocklist:${identifier}`);
+        
+        res.status(200).json({ 
+            status: "success", 
+            message: `Identifier ${identifier} unblocked successfully.` 
+        });
+    } catch (err) {
+        res.status(500).json({ status: "error", message: err.message });
+    }
+});
 
-// 3. POST /keys/delete-batch - Delete multiple keys in a single atomic transaction
-router.post('/keys/delete-batch', adminRateLimitController.deleteKeysBatch);
-
-// 4. POST /entity/block - Explicitly block an IP or User ID for a long duration
+/**
+ * @route   POST /api/admin/ratelimit/entity/block
+ * @desc    Explicitly ban an IP or User ID for a custom duration
+ */
 router.post('/entity/block', adminRateLimitController.blockEntity);
 
 
 // =====================================================================
-// 💡 COSMOS HYPER-FABRIC UTILITY ENDPOINTS (Protected by same rules)
+// 🛰️ ANALYTICS & BATCH OPERATIONS (COSMOS Analytics)
 // =====================================================================
 
-// 5. POST /policy/test-ttl-adjustment - Test the Adaptive Expiration Policy
+// List all rate limit keys (live counters) with predictive scores
+router.get('/keys', adminRateLimitController.listRateLimitKeys);
+
+// Clear a specific rate limit counter (e.g., reset a user's attempt count)
+router.delete('/keys/:key', adminRateLimitController.clearRateLimitKey);
+
+// Atomic batch deletion for cluster cleanup
+router.post('/keys/delete-batch', adminRateLimitController.deleteKeysBatch);
+
+
+// =====================================================================
+// 🧪 HYPER-FABRIC UTILITIES (Policy Testing)
+// =====================================================================
+
+// Test the Adaptive Expiration Policy logic
 router.post('/policy/test-ttl-adjustment', adminRateLimitController.testAdaptivePolicy);
 
-// 6. POST /policy/get-scores - Calculate the Predictive Blocking Score for custom key sets
+// Custom score calculation for audit logs
 router.post('/policy/get-scores', adminRateLimitController.getPredictiveScores);
 
 

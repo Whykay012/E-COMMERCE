@@ -4,11 +4,16 @@ const mongoose = require("mongoose");
 const { StatusCodes } = require("http-status-codes");
 const { performance } = require('perf_hooks');
 
-// --- Infrastructure Imports (TITAN/APOLLO/ENTERPRISE NEXUS) ---
+// --- Infrastructure Imports (OMNIA-NEXUS) ---
 const logger = require("../config/logger");
 const { CircuitBreaker, ServiceUnavailableError } = require("./circuitBreaker"); 
-const CacheUtil = require("./redisCacheUtil"); 
 const auditLogger = require("./auditLogger"); 
+
+// 💡 THE ONLY DATA SERVICE YOU NEED:
+const { 
+  getProductDetailsByIds, 
+  rebuildProductCacheAndNotify, 
+} = require('./productDataService');
 // 💡 MODIFIED IMPORT: Use structured import from the multi-tiered service
 const { 
   getProductDetailsByIds, 
@@ -25,12 +30,12 @@ const { queueJob, GENERAL_QUEUE_NAME } = require("../queue/jobQueue");
 // --- Domain/Pattern Imports ---
 const ProductValidator = require("../validators/productValidator");
 const ProductEventEmitter = require("../events/productEventEmitter");
-const { BadRequestError, } = require("../errors/bad-request-error");
-const { NotFoundError, } = require("../errors/notFoundError");
-const { DomainError } = require("../errors/domainError");
-const { ConflictError } = require("../errors/onflictError");
-const { FeatureDisabledError } = require("../errors/featureDisabledError");
-const { MediaUploadError } = require("../errors/mediaUploadError");
+const  BadRequestError = require("../errors/bad-request-error");
+const notFoundError = require("../errors/notFoundError");
+const DomainError = require("../errors/domainError");
+const ConflictError = require("../errors/onflictError");
+const FeatureDisabledError = require("../errors/featureDisabledError");
+const MediaUploadError = require("../errors/mediaUploadError");
 const { ProductInputDTO, ProductOutputDTO } = require("../dtos/productDTO"); 
 const Tracer = require("../utils/tracer"); 
 
@@ -266,50 +271,52 @@ exports.getRandomProducts = async (size, userId = null) => {
  * @param {string} id - The ID of the product.
  */
 exports.getProductById = async (id) => {
- validateId(id);
- 
- try {
-  const start = performance.now();
+  validateId(id);
   
-  // 💡 TITAN NEXUS UPGRADE: Directly call the hardened productDataService.
-  // This replaces the old CacheUtil logic and DB query for the core product.
-  const productDetails = await getProductDetailsByIds([id]);
-  const productOutput = productDetails[0];
+  try {
+    const start = performance.now();
+    
+    // 💡 CALL THE ENGINE
+    // This now handles L1, L2, and the DB Circuit Breaker internally
+    const productDetails = await getProductDetailsByIds([id]);
+    const productOutput = productDetails[0];
 
-  if (!productOutput) {
-   // The data service returns null if not found in L1/L2 and DB miss
-   logger.debug(`Product fetch missed DataService cache/DB for ID: ${id}`);
-   throw new NotFoundError(`Product with ID ${id} not found or is inactive.`);
+    // If the DB is down and the Circuit is OPEN, 
+    // the line above will throw an Error('CIRCUIT_BREAKER_OPEN')
+    
+    if (!productOutput) {
+      throw new notFoundError(`Product with ID ${id} not found.`);
+    }
+
+    // Related products: Still a DB call, but we wrap it in a secondary try/catch
+    // so that if related products fail, the main product still loads!
+    let related = [];
+    try {
+      related = await Product.find({
+        _id: { $ne: productOutput._id }, 
+        category: productOutput.category, 
+        status: "active",
+      }).limit(5).lean();
+    } catch (e) {
+      logger.warn("Related products failed to load, continuing with main product.");
+    }
+
+    return { 
+      product: productOutput, 
+      related: related.map(p => new ProductOutputDTO(p)) 
+    };
+
+  } catch (error) {
+    // 💡 NEW: Handle the Circuit Breaker "Open" state
+    if (error.message === 'CIRCUIT_BREAKER_OPEN') {
+       throw new ServiceUnavailableError("Database is under heavy load. Please try again in a moment.");
+    }
+    
+    if (error instanceof notFoundError) throw error;
+    
+    logger.error(`Critical failure in getProductById: ${error.message}`);
+    throw new DomainError("Internal system error.");
   }
-
-  // 2. Fetch related products (Requires a separate DB query since related products
-  // are dynamic and outside the core product cache entry)
-  const related = await Product.find({
-   _id: { $ne: productOutput._id }, 
-   category: productOutput.category, 
-   status: { $ne: "deleted" },
-  })
-  .limit(5)
-  .sort({ createdAt: -1 })
-  .lean();
-
-  // 3. Construct the full structured output
-  const cachedOutput = { 
-   product: productOutput, 
-   related: related.map(p => new ProductOutputDTO(p)) 
-  };
-
-  const duration = (performance.now() - start).toFixed(2);
-  logger.debug(`Product fetch complete (via DataService). Duration: ${duration}ms`);
-  
-  return cachedOutput;
-
- } catch (error) {
-  if (error instanceof NotFoundError) throw error;
-  
-  logger.error(`Failed to fetch product ${id} via DataService.`, { error: error.message });
-  throw new DomainError("Failed to retrieve product due to an internal system error.", StatusCodes.INTERNAL_SERVER_ERROR);
- }
 };
 
 

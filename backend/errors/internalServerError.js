@@ -8,4 +8,4 @@ class InternalServerError extends CustomApiError {
   }
 }
 
-module.exports = InternalServerError;
+module.exports = { InternalServerError };

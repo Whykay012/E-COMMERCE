@@ -27,57 +27,7 @@ const {
  * 🔐 SECURITY: AUTH & SESSION
  * =========================== */
 
-/**
- * @desc ZENITH APEX LOGOUT
- * Invalidates the current JTI in Redis and clears all Enterprise-grade cookies.
- * Access: Private
- */
-const logout = asyncHandler(async (req, res) => {
-  const { jti, exp } = req.user;
 
-  // 1. Atomic Revocation in Redis
-  if (jti && exp) {
-    await blacklistToken(jti, exp);
-  }
-
-  // 2. Comprehensive Cookie Clearance
-  // Note: We pass the specific options to ensure the browser matches the
-  // domain/path/secure flags during the deletion process.
-  res.clearCookie(ACCESS_COOKIE_NAME, COOKIE_OPTIONS_ACCESS);
-  res.clearCookie(REFRESH_COOKIE_NAME, COOKIE_OPTIONS_REFRESH);
-  res.clearCookie(CSRF_COOKIE_NAME, COOKIE_OPTIONS_CSRF);
-
-  res.status(StatusCodes.OK).json({
-    success: true,
-    message: "Logout successful. Session artifacts destroyed.",
-  });
-});
-
-/**
- * @desc THE KILL SWITCH: Forcefully logs out user from ALL devices and resets security state
- * Orchestrates physical wipe in Redis and version increment in MongoDB.
- */
-const triggerPanicLogout = asyncHandler(async (req, res) => {
-  const userId = req.user.userID;
-
-  // This service call invalidates all sessions AND increments 'securityVersion' in DB
-  await userService.globalPanicRevocation(
-    userId,
-    req.user.userID,
-    "User-initiated emergency security reset"
-  );
-
-  // Clear all security cookies immediately
-  res.clearCookie(ACCESS_COOKIE_NAME, COOKIE_OPTIONS_ACCESS);
-  res.clearCookie(REFRESH_COOKIE_NAME, COOKIE_OPTIONS_REFRESH);
-  res.clearCookie(CSRF_COOKIE_NAME, COOKIE_OPTIONS_CSRF);
-
-  res.status(StatusCodes.OK).json({
-    success: true,
-    message:
-      "Global security reset successful. All devices have been logged out.",
-  });
-});
 
 /* ===========================
  * 🔐 SECURITY: WEBAUTHN / STEP-UP
@@ -308,7 +258,7 @@ const getUserPayments = asyncHandler(async (req, res) => {
  * ✅ EXPORTS
  * =========================== */
 module.exports = {
-  logout,
+  
   getStepUpOptions,
   finalizeStepUp,
   getUserDashboard,
@@ -325,5 +275,4 @@ module.exports = {
   removeFromWishlist,
   getUserPayments,
   downloadReceipt,
-  triggerPanicLogout,
 };

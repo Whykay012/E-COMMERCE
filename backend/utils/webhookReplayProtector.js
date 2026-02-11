@@ -1,17 +1,7 @@
-// utils/preventReplay.js
-// Enterprise-grade replay protection with:
-// - Redis Lua atomic check+set
-// - Signature binding
-// - Dead-letter queue (BullMQ)
-// - Immutable ledger (Mongo)
-// - Prometheus metrics
-// - Memory fallback and cross-region notes
-
 "use strict";
 
 const crypto = require("crypto");
-const { Queue } = require("bullmq");
-const { getRedisClient } = require("../lib/redisClient");
+const { getRedisClient } = require("../lib/redisClient"); 
 const ImmutableWebhookRecord = require("../model/ImmutableWebhookRecord");
 const promClient = require("prom-client");
 
@@ -21,8 +11,8 @@ const promClient = require("prom-client");
 const DEFAULT_TTL_SECONDS = Number(process.env.WEBHOOK_REPLAY_TTL || 24 * 3600);
 const MEMORY_FALLBACK_LIMIT = Number(process.env.MEMORY_FALLBACK_LIMIT || 10000);
 const REDIS_KEY_PREFIX = process.env.WEBHOOK_REPLAY_PREFIX || "webhook:replay";
-const DLQ_QUEUE_NAME = process.env.WEBHOOK_DLQ_QUEUE || "webhook-dlq";
-const DLQ_RETRY_DELAY_MS = Number(process.env.WEBHOOK_DLQ_RETRY_DELAY_MS || 60 * 1000);
+const REPLAY_BAN_THRESHOLD = Number(process.env.REPLAY_BAN_THRESHOLD || 5);
+const REPLAY_BAN_TTL = Number(process.env.REPLAY_BAN_TTL || 3600);
 
 // ---------------------------
 // Prometheus metrics
@@ -38,62 +28,40 @@ const metric_replayed_webhooks = new promClient.Counter({
   name: "webhook_replay_detected_total",
   help: "Detected replayed webhook attempts",
 });
-const metric_dlq_enqueued = new promClient.Counter({
-  name: "webhook_replay_dlq_enqueued_total",
-  help: "Webhook events enqueued to DLQ due to replay or failure",
-});
 const metric_redis_fallbacks = new promClient.Counter({
   name: "webhook_replay_redis_fallback_total",
   help: "Count of times Redis was unavailable and memory fallback used",
 });
 
-[
-  metric_new_webhooks,
-  metric_replayed_webhooks,
-  metric_dlq_enqueued,
-  metric_redis_fallbacks,
-].forEach(m => registry.registerMetric(m));
-
-// expose registry accessor
-function getPromRegistry() { return registry; }
+[metric_new_webhooks, metric_replayed_webhooks, metric_redis_fallbacks].forEach(m => registry.registerMetric(m));
 
 // ---------------------------
-// LUA script — atomic EXISTS + SET EX
-// returns 1 when key exists (replay), 0 when inserted
-// ---------------------------
-const LUA_CHECK_AND_SET = `
-if redis.call("EXISTS", KEYS[1]) == 1 then
-  return 1
-else
-  redis.call("SET", KEYS[1], "1", "EX", ARGV[1])
-  return 0
-end
-`;
-
-// ---------------------------
-// in-memory fallback
+// MEMORY UPGRADE: LRU Strategy
 // ---------------------------
 const memoryStore = new Map();
+const memoryExpiries = new Map();
 
 function memoryReplayCheck(key, ttlSeconds) {
-  if (memoryStore.has(key)) return true;
-  memoryStore.set(key, Date.now());
-
-  if (memoryStore.size > MEMORY_FALLBACK_LIMIT) {
-    const first = memoryStore.keys().next().value;
-    memoryStore.delete(first);
+  const now = Date.now();
+  if (memoryExpiries.has(key) && now > memoryExpiries.get(key)) {
+    memoryStore.delete(key);
+    memoryExpiries.delete(key);
   }
-
-  setTimeout(() => memoryStore.delete(key), ttlSeconds * 1000).unref();
+  if (memoryStore.has(key)) return true;
+  if (memoryStore.size >= MEMORY_FALLBACK_LIMIT) {
+    const oldestKey = memoryStore.keys().next().value;
+    memoryStore.delete(oldestKey);
+    memoryExpiries.delete(oldestKey);
+  }
+  memoryStore.set(key, true);
+  memoryExpiries.set(key, now + (ttlSeconds * 1000));
   return false;
 }
 
 // ---------------------------
-// fingerprint builder
-// includes rawBody (or its hash), provider, providerId, and optional signature binding
+// Fingerprint builder
 // ---------------------------
 function buildFingerprint(rawBody, provider = "unknown", providerId = "", signature = "") {
-  // Use rawBody hash to avoid storing large buffers
   const bodyHash = rawBody && Buffer.isBuffer(rawBody)
     ? crypto.createHash("sha256").update(rawBody).digest("hex")
     : rawBody ? crypto.createHash("sha256").update(String(rawBody)).digest("hex") : "";
@@ -110,58 +78,10 @@ function buildFingerprint(rawBody, provider = "unknown", providerId = "", signat
 }
 
 // ---------------------------
-// BullMQ DLQ queue (for replays/failures/warnings)
-// You must have a Redis connection available via getRedisClient()
-// ---------------------------
-const redisClient = getRedisClient && getRedisClient();
-let dlqQueue = null;
-try {
-  if (redisClient) {
-    dlqQueue = new Queue(DLQ_QUEUE_NAME, { connection: redisClient });
-  }
-} catch (err) {
-  // Non-fatal — DLQ might be unavailable in some environments. We'll still operate.
-  console.warn("[preventReplay] DLQ queue init failed:", err.message);
-}
-
-// ---------------------------
-// enqueue to DLQ
-// ---------------------------
-async function enqueueToDLQ({ reason, provider, providerId, fingerprint, bodyHash, rawBody, headers, parsedPayload }) {
-  metric_dlq_enqueued.inc();
-  if (!dlqQueue) {
-    // best-effort fallback: log and return
-    console.warn("[preventReplay] DLQ queue not initialized — skipping enqueue", reason, fingerprint);
-    return;
-  }
-  try {
-    const payload = {
-      reason,
-      provider,
-      providerId,
-      fingerprint,
-      bodyHash,
-      headers,
-      parsedPayload,
-      enqueuedAt: new Date().toISOString(),
-    };
-    await dlqQueue.add("dlq-webhook", payload, {
-      removeOnComplete: true,
-      removeOnFail: false,
-      attempts: 5,
-      backoff: { type: "exponential", delay: DLQ_RETRY_DELAY_MS },
-    });
-  } catch (err) {
-    console.error("[preventReplay] Failed to enqueue to DLQ:", err.message);
-  }
-}
-
-// ---------------------------
-// Write immutable ledger (first-time append-only)
+// Write immutable ledger
 // ---------------------------
 async function writeImmutableRecord({ provider, providerId, fingerprint, signature, rawBodyHash, parsedPayload, metadata = {} }) {
   try {
-    // Upsert style: only create if not exists (avoid race)
     const created = await ImmutableWebhookRecord.findOneAndUpdate(
       { fingerprint },
       {
@@ -176,20 +96,16 @@ async function writeImmutableRecord({ provider, providerId, fingerprint, signatu
           metadata: metadata || null,
         }
       },
-      { upsert: true, new: false } // new:false returns existing doc, ensuring we only write once
+      { upsert: true, new: false }
     );
-    // If created is null => it was inserted; metric increment
     if (!created) metric_new_webhooks.inc();
   } catch (err) {
     console.error("[preventReplay] immutable ledger write failed:", err.message);
-    // non-fatal — do not block webhook processing
   }
 }
 
 // ---------------------------
-// main function: preventReplay()
-// returns true = replay detected, false = new
-// options: { rawBody, provider, providerId, signature, parsedPayload, ttlSeconds, headers, metadata }
+// Main: preventReplay()
 // ---------------------------
 async function preventReplay({
   rawBody,
@@ -201,70 +117,74 @@ async function preventReplay({
   headers = {},
   metadata = {},
 } = {}) {
-  if (!rawBody) throw new Error("preventReplay requires rawBody (Buffer or string)");
+  if (!rawBody) throw new Error("preventReplay requires rawBody");
 
   const { fingerprint, bodyHash } = buildFingerprint(rawBody, provider, providerId, signature);
   const redisKey = `${REDIS_KEY_PREFIX}:${provider}:${fingerprint}`;
+  const banKey = `${redisKey}:ban`; 
 
-  const redis = getRedisClient && getRedisClient();
+  let redis;
+  try {
+    redis = getRedisClient();
+  } catch (e) {
+    redis = null;
+  }
 
-  // primary path: Redis + atomic Lua
+  // --- Path 1: Redis Cluster with replayGuard ---
   if (redis && redis.status === "ready") {
     try {
-      const res = await redis.eval(LUA_CHECK_AND_SET, 1, redisKey, ttlSeconds);
-      if (res === 1) {
-        // replay detected
+      const res = await redis.replayGuard(
+        redisKey,       // KEYS[1]
+        banKey,         // KEYS[2]
+        ttlSeconds,     // ARGV[1]
+        REPLAY_BAN_THRESHOLD, // ARGV[2]
+        REPLAY_BAN_TTL        // ARGV[3]
+      );
+
+      /**
+       * 💡 THE "PERFECT" LOGIC:
+       * res[0] is the current count.
+       * If count > 1, it's a replay.
+       * If res[1] is 1, it's a "Banned" replay.
+       */
+      if (res && res[0] > 1) {
         metric_replayed_webhooks.inc();
-        // enqueue to DLQ for investigation
-        await enqueueToDLQ({ reason: "replay_detected", provider, providerId, fingerprint, bodyHash, rawBody: null, headers, parsedPayload });
-        return true;
-      } else {
-        // first-seen — write immutable ledger
-        try {
-          await writeImmutableRecord({ provider, providerId, fingerprint, signature, rawBodyHash: bodyHash, parsedPayload, metadata });
-        } catch (err) {
-          // ledger failure should not block processing
-          console.warn("[preventReplay] ledger write failed (non-fatal)", err.message);
+
+        // If it triggered a ban, send high-priority alert to OMEGA Stream
+        if (res[1] === 1) {
+          await redis.xadd("dlq:stream:jobs", "*", "payload", JSON.stringify({
+             reason: "replay_ban_triggered",
+             fingerprint,
+             provider,
+             finalCount: res[0]
+          }));
         }
-        return false;
+        return true; // BLOCK THE WEBHOOK
       }
+
+      // If we are here, count is 1 (first time seeing it)
+      await writeImmutableRecord({ provider, providerId, fingerprint, signature, rawBodyHash: bodyHash, parsedPayload, metadata });
+      return false;
+
     } catch (err) {
-      // Redis hiccup: fallback to memory
       metric_redis_fallbacks.inc();
-      console.warn("[preventReplay] Redis eval failed; falling back to memory:", err.message);
-      const memReplay = memoryReplayCheck(redisKey, ttlSeconds);
-      if (memReplay) {
-        metric_replayed_webhooks.inc();
-        // optionally send to DLQ to track degraded state
-        await enqueueToDLQ({ reason: "replay_detected_memory_fallback", provider, providerId, fingerprint, bodyHash, rawBody: null, headers, parsedPayload });
-        return true;
-      } else {
-        await writeImmutableRecord({ provider, providerId, fingerprint, signature, rawBodyHash: bodyHash, parsedPayload, metadata });
-        return false;
-      }
+      console.warn("[preventReplay] Redis Cluster command failed:", err.message);
     }
   }
 
-  // no redis available: memory fallback
+  // --- Path 2: Memory Fallback ---
   metric_redis_fallbacks.inc();
-  const memReplay = memoryReplayCheck(redisKey, ttlSeconds);
-  if (memReplay) {
+  if (memoryReplayCheck(redisKey, ttlSeconds)) {
     metric_replayed_webhooks.inc();
-    await enqueueToDLQ({ reason: "replay_detected_memory_fallback", provider, providerId, fingerprint, bodyHash, rawBody: null, headers, parsedPayload });
     return true;
-  } else {
-    await writeImmutableRecord({ provider, providerId, fingerprint, signature, rawBodyHash: bodyHash, parsedPayload, metadata });
-    return false;
   }
+
+  await writeImmutableRecord({ provider, providerId, fingerprint, signature, rawBodyHash: bodyHash, parsedPayload, metadata });
+  return false;
 }
 
-// ---------------------------
-// small helper to expose metrics & DLQ queue for other modules
-// ---------------------------
 module.exports = {
   preventReplay,
   buildFingerprint,
-  enqueueToDLQ, // useful for other flows
-  getPromRegistry,
-  DLQ_QUEUE_NAME,
+  getPromRegistry: () => registry,
 };

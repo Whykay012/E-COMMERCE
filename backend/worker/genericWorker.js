@@ -19,7 +19,7 @@ const {
   disconnectRedis, 
   initializeRedlock, 
   startDeadLetterWorker 
-} = require("../utils/redisClient"); 
+} = require("../event/lib/redisClient"); 
 const { getRedisConnectionDetails } = require("../config/redisConnection"); 
 
 // --- Configuration & Env validation ---

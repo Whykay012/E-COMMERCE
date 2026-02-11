@@ -947,3 +947,233 @@
 // module.exports = PaymentService;
 // module.exports.prometheusRegistry = prometheusRegistry;
 // module.exports.executeAtomicOrderUpdate = executeAtomicOrderUpdate;
+"use strict";
+
+const crypto = require("crypto");
+const Logger = require("../../utils/logger");
+const Tracing = require("../../utils/tracingClient");
+const { packRateLimitKey } = require("../../utils/redisKey");
+const { preventReplay } = require("../../utils/webhookReplayProtector");
+const { getRedisClient } = require("../../lib/redisClient");
+
+const ALGORITHMS = {
+    FWC: "FWC",
+    SWL: "SWL",
+};
+
+/**
+ * COSMOS HYPER-FABRIC OMEGA: Rate Limiter Factory
+ * ----------------------------------------------
+ * Properly flattens the middleware generation to ensure Redis is available
+ * and LUA scripts execute correctly across the cluster.
+ */
+function createRateLimiterFactory({
+    shas,
+    temporarilyBlock,
+    isBlocked,
+    getFabricStatus,
+}) {
+    // Basic validation of required factory tools
+    if (!shas || !shas.FWC || !shas.SWL) {
+        throw new Error("RateLimiter Factory: Missing pre-loaded LUA SHAs.");
+    }
+
+    const defaultIdentifierFn = (req) => {
+        if (req.user && (req.user._id || req.user.id)) {
+            return `user:${(req.user._id || req.user.id).toString()}`;
+        }
+        const ip =
+            req.headers["x-forwarded-for"]?.split(",").shift() ||
+            req.ip ||
+            req.connection?.remoteAddress;
+        return `ip:${ip || "unknown"}`;
+    };
+
+    /**
+     * Returns the actual configured limiter instance
+     */
+    return function createLimiter({
+        algorithm = ALGORITHMS.FWC,
+        windowSeconds = 60,
+        max = 120,
+        keyPrefix = "rl",
+        identifierFn,
+        blockOnExceed = { enabled: false, banSeconds: 300 },
+        softBanDelayMs = 0,
+        penaltySeconds = 0,
+    } = {}) {
+        const scriptSha = shas[algorithm];
+        const getIdentifier = identifierFn || defaultIdentifierFn;
+
+        // THE ACTUAL MIDDLEWARE RETURNED TO EXPRESS
+        return async (req, res, next) => {
+            // 1. Ensure Redis is Ready (Lazy Loading)
+            let redisClient;
+            try {
+                redisClient = getRedisClient();
+            } catch (e) {
+                redisClient = null;
+            }
+
+            if (!redisClient || redisClient.status !== "ready") {
+                Logger.warn("RATE_LIMITER_FAIL_OPEN_REDIS_NOT_READY");
+                return next();
+            }
+
+            // 2. Correlation ID
+            if (!req.ingressRequestId) {
+                req.ingressRequestId = crypto.randomUUID();
+            }
+
+            // 3. Health Check
+            if (getFabricStatus && !getFabricStatus()) {
+                Logger.warn("RATE_LIMITER_FAIL_OPEN_FABRIC_UNHEALTHY", {
+                    route: req.originalUrl,
+                    ingressRequestId: req.ingressRequestId,
+                });
+                return next();
+            }
+
+            const span = Tracing.startSpan(`rateLimiter:${algorithm}`);
+
+            try {
+                const identifier = getIdentifier(req);
+                const blockKey = identifier;
+                const limitKey = packRateLimitKey(keyPrefix, identifier);
+
+                req.rateLimitKey = limitKey;
+
+                span.setAttribute("rateLimit.algorithm", algorithm);
+                span.setAttribute("rateLimit.identifier", identifier);
+                span.setAttribute("rateLimit.key", limitKey);
+                span.setAttribute("rateLimit.ingressRequestId", req.ingressRequestId);
+
+                // A. GLOBAL BLOCKLIST CHECK
+                if (isBlocked && await isBlocked(redisClient, blockKey)) {
+                    span.setAttribute("rateLimit.result", "BLOCKED");
+                    res.setHeader("Retry-After", String(blockOnExceed.banSeconds || 300));
+                    return res.status(429).json({
+                        status: "fail",
+                        message: "Temporarily blocked due to abusive activity.",
+                    });
+                }
+
+                // B. REPLAY PROTECTION
+                const replayEnabled =
+                    req.method !== "GET" &&
+                    req.method !== "HEAD" &&
+                    req.method !== "OPTIONS" &&
+                    (req.headers["x-event-id"] || req.headers["x-webhook-id"] || req.headers["x-provider"]);
+
+                if (replayEnabled && req.rawBody) {
+                    const eventId = req.headers["x-event-id"] || req.headers["x-webhook-id"] || "";
+                    const isReplay = await preventReplay({
+                        rawBody: eventId || req.rawBody,
+                        provider: req.headers["x-provider"] || "http",
+                        providerId: req.headers["x-provider-id"] || "",
+                        signature: req.headers["x-signature"] || "",
+                        parsedPayload: req.body,
+                        headers: req.headers,
+                        metadata: {
+                            route: req.originalUrl,
+                            identifier,
+                            ingressRequestId: req.ingressRequestId,
+                        },
+                    });
+
+                    if (isReplay) {
+                        span.setAttribute("rateLimit.result", "REPLAY_BLOCKED");
+                        const replayBlockKey = `replay:${identifier}:${req.route?.path || "unknown"}`;
+                        if (temporarilyBlock) await temporarilyBlock(redisClient, replayBlockKey, 600);
+                        
+                        res.setHeader("Retry-After", "600");
+                        return res.status(429).json({
+                            status: "fail",
+                            code: "REPLAY_DETECTED",
+                            message: "Duplicate request detected",
+                        });
+                    }
+                }
+
+                // C. LUA EXECUTION
+                let currentCount, ttlSeconds, allowed;
+                let results;
+
+                if (algorithm === ALGORITHMS.SWL) {
+                    const windowMs = windowSeconds * 1000;
+                    // SWL Script typically returns [allowed, currentCount, ttlMs]
+                    results = await redisClient.evalsha(
+                        scriptSha,
+                        1,
+                        limitKey,
+                        max,
+                        windowMs,
+                        penaltySeconds
+                    );
+                    allowed = results[0];
+                    currentCount = results[1];
+                    ttlSeconds = Math.ceil(results[2] / 1000);
+                } else {
+                    // FWC Script typically returns [currentCount, ttlSeconds]
+                    results = await redisClient.evalsha(
+                        scriptSha,
+                        1,
+                        limitKey,
+                        max,
+                        windowSeconds
+                    );
+                    currentCount = results[0];
+                    ttlSeconds = results[1];
+                }
+
+                const exceeded = currentCount > max;
+                const remaining = Math.max(0, max - currentCount);
+                const resetIn = ttlSeconds > 0 ? ttlSeconds : windowSeconds;
+
+                res.setHeader("X-RateLimit-Limit", String(max));
+                res.setHeader("X-RateLimit-Remaining", String(remaining));
+                res.setHeader("X-RateLimit-Reset", String(resetIn));
+
+                if (exceeded) {
+                    span.setAttribute("rateLimit.result", "EXCEEDED");
+                    
+                    if (blockOnExceed?.enabled && temporarilyBlock) {
+                        await temporarilyBlock(
+                            redisClient,
+                            blockKey,
+                            blockOnExceed.banSeconds || 300
+                        );
+                    }
+
+                    if (softBanDelayMs > 0) {
+                        await new Promise((r) => setTimeout(r, softBanDelayMs));
+                    }
+
+                    res.setHeader("Retry-After", String(resetIn));
+                    return res.status(429).json({
+                        status: "fail",
+                        code: "RATE_LIMIT_EXCEEDED",
+                        message: `Rate limit exceeded. Try again in ${resetIn} seconds.`,
+                    });
+                }
+
+                span.setAttribute("rateLimit.result", "ALLOWED");
+                span.end();
+                return next();
+
+            } catch (err) {
+                Logger.error("RATE_LIMITER_ERROR_FAIL_OPEN", {
+                    error: err.message,
+                    ingressRequestId: req.ingressRequestId,
+                });
+                if (span) {
+                    span.recordError(err);
+                    span.end();
+                }
+                return next();
+            }
+        };
+    };
+}
+
+module.exports = { ALGORITHMS, createRateLimiterFactory };

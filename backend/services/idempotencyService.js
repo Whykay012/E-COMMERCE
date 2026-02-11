@@ -1,7 +1,7 @@
 // services/idempotencyService.js (Production-Ready)
 
 const crypto = require("crypto");
-const { Queue, Worker, QueueScheduler } = require("bullmq"); 
+const { Queue, Worker } = require("bullmq"); 
 const Redis = require("ioredis");
 const IdempotencyRecord = require("../model/idempotencySchema"); // Assumed to be your Mongoose model
 
@@ -24,12 +24,13 @@ if (!IDEMPOTENCY_SECRET || IDEMPOTENCY_SECRET.length < 16) {
     throw new Error("FATAL: IDEMPOTENCY_SECRET environment variable missing or too short (must be >= 16 chars)");
 }
 
-const redis = new Redis(REDIS_URL);
+const redis = new Redis(REDIS_URL, {
+    maxRetriesPerRequest: null, // This is mandatory for BullMQ
+});
 const connection = redis;
 
 // BullMQ setup for background jobs (cleanup, aggregation, etc.)
 const idempotencyQueue = new Queue("idempotencyQueue", { connection });
-const idempotencyScheduler = new QueueScheduler("idempotencyQueue", { connection });
 
 // Configurable TTLs (using sensible defaults if env vars are missing)
 const REDIS_LOCK_TTL = parseInt(process.env.REDIS_LOCK_TTL) || 60; // 60 seconds for lock
@@ -441,7 +442,7 @@ async function shutdown() {
     
     // Shut down BullMQ components
     await idempotencyQueue.close();
-    await idempotencyScheduler.close();
+ 
     // Worker exit should be handled by process termination logic, but we can stop it if running standalone
     // await idempotencyWorker.close(); 
     

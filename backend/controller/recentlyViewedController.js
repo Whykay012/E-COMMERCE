@@ -6,7 +6,7 @@ const NotFoundError = require("../errors/notFoundError");
 const { logActivity, getActivitiesByUser } = require("../utils/activityLogger"); 
 const yup = require("yup");
 const AuditLogger = require("../services/auditLogger"); 
-const { getRedisClient } = require("../utils/redisClient"); 
+const { getRedisClient } = require("../event/lib/redisClient"); 
 
 // Import the new product data service (which contains L1/L2/Redlock logic)
 const { getProductDetailsByIds } = require("../services/productDataService"); 

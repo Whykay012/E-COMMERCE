@@ -6,7 +6,7 @@
 const Logger = require('../utils/logger'); // ULTIMATE PINO LOGGER
 const Metrics = require('../utils/metricsClient'); // STATSD CLIENT
 const Tracing = require('../utils/tracingClient'); // OTel CLIENT
-const cache = require("./redisCacheUtil"); // ADVANCED CACHE UTIL (With Lock/SWR)
+const cache = require("../lib/redisCacheUtil"); // ADVANCED CACHE UTIL (With Lock/SWR)
 const BreakerRegistry = require('./breakerRegistry'); // Registry for the new CircuitBreaker class
 const broker = require('./messageBrokerClient'); // KAFKA PRODUCER
 const crypto = require('crypto');
@@ -135,25 +135,43 @@ const NotificationService = {
     // 🚀 INBOX OPERATIONS (READ-THROUGH CACHE)
     // =================================================================================
 
+   /**
+     * @desc Retrieves user notifications with advanced cache handling.
+     * Uses Option B's metadata-aware caching to identify stale vs fresh data.
+     */
     async getUserNotifications(userID, query) {
         const cacheKey = `notifs:u:${userID}:c:${query.cursor || 'start'}:l:${query.limit}`;
         
-        // TITAN NEXUS UPGRADE: Using advanced 'cached' method with lock/stampede protection
-        return await cache.cached(
+        // TITAN NEXUS UPGRADE: Using advanced 'cached' method
+        const result = await cache.cached(
             cacheKey,
             300, // 5 min Fresh TTL
             async () => {
                 Metrics.cacheMiss('notifications_inbox');
-                // Simulate Database Fetch
+                
+                // --- DATABASE LOGIC ---
+                // In production: return await NotificationModel.find({ userID })...
                 return { 
                     notifications: [], 
                     nextCursor: null, 
                     unreadCount: 0,
                     fetchedAt: new Date().toISOString() 
                 };
+                // ----------------------
             },
             3600 // 1 hour Stale TTL (SWR Support)
         );
+
+        // 💡 ZENITH UPGRADE: Add a 'X-Cache-Status' hint for the caller/controller
+        // We extract the value but can log or flag if the data is stale
+        if (result.stale) {
+            Metrics.increment('notif.cache.served_stale');
+            Logger.debug('SERVING_STALE_NOTIFICATIONS', { userID, cacheKey });
+        }
+
+        // Return just the value (the data) to keep the API contract clean,
+        // or return the whole object if your frontend wants to show a "Last Updated" warning.
+        return result.value; 
     },
 
     async markAsRead(userID, id) {

@@ -8,7 +8,7 @@ const BadRequestError = require("../errors/bad-request-error");
 const NotFoundError = require("../errors/notFoundError");
 const ConflictError = require('../errors/conflictError');
 const UnauthorizedError = require('../errors/unauthorized-error');
-const TransientPaymentError = require("../lib/errorClasses"); // Custom error for retryable failures
+const TransientPaymentError = require("../event/lib/errorClasses"); // Custom error for retryable failures
 const ForbiddenError = require("../errors/forbidden-error"); // For token expiry denial
 
 // External Service Integrations (Peak Zenith Dependency)

@@ -10,9 +10,9 @@ const IdempotencyKey = require("../model/idempotencyKey");
 const Address = require("../model/addressModel");
 const PaymentService = require("./paymentServices");
 // --- 🚨 CORRECTION: Use standard error names from customErrors.js ---
-const { BadRequestError } = require("../errors/customErrors"); // Corrected import
-const { NotFoundError } = require("../errors/customErrors"); // Corrected import
-const { ConflictError } = require("../errors/customErrors"); // Corrected import
+const BadRequestError  = require("../errors/bad-requesr-error"); // Corrected import
+const NotFoundError  = require("../errors/notFoundErrror"); // Corrected import
+const ConflictError  = require("../errors/conflictError"); // Corrected import
 const ConcurrencyError = require("../errors/concurrencyError"); // Assumed correct import
 
 // --- 🚀 UPGRADE: Import queue names ---

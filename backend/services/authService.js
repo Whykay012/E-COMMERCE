@@ -1,55 +1,54 @@
 // --- 💡 Core Dependencies ---
 const User = require("../model/userModel");
 const AuthenticationError = require("../errors/unauthenication-error");
-const InternalServerError = require("../errors/internal-server-error");
+const InternalServerError = require("../errors/internalServerError");
 const BadRequestError = require("../errors/bad-request-error");
-const ForbiddenError = require("../errors/forbidden-error"); // New Error for Policy/RBAC
+const ForbiddenError = require("../errors/forbiddenError"); // New Error for Policy/RBAC
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 const { timingSafeEqual } = require("crypto");
 // NEW Concrete Import (using your provided file)
-const { CircuitBreaker } = require("../services/circuitBreaker"); // Adjust path as necessary
+const { CircuitBreaker } = require("./circuitBreaker"); // Adjust path as necessary
 const {
   calculatePasswordRisk,
   getConfig,
 } = require("../utils/securityPolicyUtils");
-const Outbox = require("../model/outboxModel");
+const Outbox = require("../model/outbox");
 const hashToken = require("../utils/token-utils");
 const generateOTP = require("../utils/otp-utils");
-const crypto = require("crypto");
-const IdempotencyService = require("../services/idempotencyService");
+const IdempotencyService = require("./idempotencyService");
 // const { getConfig } = require('../utils/configManager');
 
 // --- 📈 Telemetry Dependencies (INTEGRATED) ---
 const Logger = require("../utils/logger");
 const metricsClient = require("../utils/metricsClient");
 const tracingClient = require("../utils/tracingClient");
-const { instrument } = require("./instrumentationWrapper");
+const { instrument } = require("../utils/authInstrumentation");
 // --- 👑 AUDIT FACADE (RESILIENT) ---
-const auditLogger = require("../services/auditLogger");
+const auditLogger = require("./auditLogger");
 
 // --- 💡 External Dependencies (ASSUMED IMPLEMENTED)
-const identityService = require("../services/identityService"); // Handles JWT/Token logic
-const geoIpService = require("../services/geoIpService");
-const mfaService = require("../services/mfaService");
+const identityService = require("./identityService"); // Handles JWT/Token logic
+const geoIpService = require("./geoIpService");
+const mfaService = require("./mfaService");
 const {
   otpRateLimiter,
   // resendRateLimiter,
   passwordResetLimiter,
-} = require("../services/rateLimiters/rateLimiterInstances");
+} = require("./rateLimiter/rateLimiterInstances");
 
-const resendRateLimiter = require("../services/rateLimiters/standaloneLimiters");
-const passwordHistoryService = require("../services/passwordHistoryService");
-const policyEngine = require("../services/policyEngine"); // New: RBAC/ABAC Engine
-const systemIdentityService = require("../services/systemIdentityService"); // New: M2M Tokens
-const complianceService = require("../services/complianceService"); // New: GDPR/CCPA
-const webAuthnService = require("../services/webAuthnService"); // New: FIDO2/WebAuthn handling
+const resendRateLimiter = require("./rateLimiter/standaloneLimiters");
+const passwordHistoryService = require("./passwordHistoryService");
+const policyEngine = require("./policyEngine"); // New: RBAC/ABAC Engine
+const systemIdentityService = require("./systemIdentityService"); // New: M2M Tokens
+const complianceService = require("./complianceService"); // New: GDPR/CCPA
+const webAuthnService = require("./webAuthnService"); // New: FIDO2/WebAuthn handling
 const HealthMonitor = require("../utils/HealthMonitor"); // Placeholder for HealthMonitor dependency
 
 // --- 💡 EVENT/ASYNC DEPENDENCIES (ASSUMED IMPLEMENTED)
 const queueClient = require("./queueAdapters/queueClient");
-const securityService = require("../services/securityService");
-const websocketService = require("../services/websocketService");
+const securityService = require("./securityService");
+const websocketService = require("./websocketService");
 
 // 💡 CIRCUIT BREAKER INSTANCE
 const emailDispatchBreaker = new CircuitBreaker(
@@ -125,77 +124,104 @@ const getPasswordExpiryStatus = (lastUpdatedDate) => {
  * =========================== */
 
 /**
- * @desc Atomically records a failed login attempt using Lua ReplayGuard and DB updates.
+ * @desc ZENITH-ULTRA: Record Failed Login Attempt
+ * Combined Two-Tier Defense: Redis Lua Replay Guard + Atomic MongoDB Update
  */
 const recordFailedAttempt = async (userId, clientIp, identifier) => {
   const redis = getRedisClient();
-
-  // 1. Redis Lua Replay Guard (Distributed Sliding Window)
-  // Use hashtags {} for Cluster sharding compatibility
   const replayKey = `{user:${userId}}:replay:cnt`;
   const banKey = `{user:${userId}}:replay:ban`;
 
-  // Window: 600s, Threshold: 5, Ban: 3600s
-  const [redisCount, isRedisBanned] = await redis.replayGuard(
-    replayKey,
-    banKey,
-    600,
-    LOCKOUT_THRESHOLD,
-    3600,
-  );
+  try {
+    // 1. REDIS LAYER (Sliding Window / Replay Guard)
+    // Prevents rapid-fire brute force without hitting DB every time
+    // Window: 600s, Threshold: LOCKOUT_THRESHOLD, Ban: 3600s
+    const [redisCount, isRedisBanned] = await redis.replayGuard(
+      replayKey,
+      banKey,
+      600,
+      LOCKOUT_THRESHOLD,
+      3600
+    );
 
-  // 2. Database Atomic Update
-  const updatedUser = await User.findByIdAndUpdate(
-    userId,
-    { $inc: { failedLoginAttempts: 1 } },
-    { new: true },
-  ).lean();
+    // 2. DATABASE PREPARATION
+    // Fetch current state to determine if this specific increment triggers a lock
+    const user = await User.findById(userId).select("failedLoginAttempts email role");
+    if (!user) return;
 
-  if (!updatedUser) return;
+    const newAttempts = user.failedLoginAttempts + 1;
+    let updateData = { $inc: { failedLoginAttempts: 1 } };
+    let auditEvent = null;
 
-  const attempts = updatedUser.failedLoginAttempts;
-  let updateOperation = {};
+    // 3. LOCKOUT LOGIC DETERMINATION
+    if (newAttempts >= LOCKOUT_THRESHOLD || isRedisBanned === 1) {
+      // Tier 1: Temporary Lockout
+      updateData.$set = {
+        isLocked: true,
+        lockoutUntil: new Date(Date.now() + TEMPORARY_LOCKOUT_MS),
+      };
+      auditEvent = "ACCOUNT_LOCKED_TEMPORARY";
+    } else if (newAttempts > 0 && newAttempts % MAX_FAILED_ATTEMPTS === 0) {
+      // Tier 2: Permanent Lockout (Requires manual Admin unlock)
+      updateData.$set = { isLocked: true, lockoutUntil: null };
+      auditEvent = "ACCOUNT_LOCKED_PERMANENT";
+    }
 
-  if (attempts >= LOCKOUT_THRESHOLD || isRedisBanned === 1) {
-    updateOperation = {
-      isLocked: true,
-      lockoutUntil: new Date(Date.now() + TEMPORARY_LOCKOUT_MS),
-    };
+    // 4. ATOMIC DATABASE UPDATE
+    // Executes increment and potential lock in a single round-trip
+    await User.findByIdAndUpdate(userId, updateData);
 
-    auditLogger.log({
-      level: "WARN",
-      event: "ACCOUNT_LOCKED_TEMPORARY",
-      userId,
-      details: {
-        reason: "ReplayGuard or DB Threshold Hit",
-        attempts,
-        ip: clientIp,
-      },
+    // 5. AUDIT & TELEMETRY
+    if (auditEvent) {
+      await auditLogger.dispatchLog({
+        level: auditEvent === "ACCOUNT_LOCKED_PERMANENT" ? "CRITICAL" : "WARN",
+        event: auditEvent,
+        userId,
+        details: {
+          reason: isRedisBanned === 1 ? "Redis Replay Guard Triggered" : "DB Threshold Hit",
+          attempts: newAttempts,
+          ip: clientIp,
+          identifier
+        },
+      });
+    }
+
+    // Performance Metrics
+    metricsClient.increment("security.login.attempt.fail", 1, { 
+      userId, 
+      tier: auditEvent ? "locked" : "counted" 
     });
-  } else if (attempts > 0 && attempts % MAX_FAILED_ATTEMPTS === 0) {
-    updateOperation = { isLocked: true, lockoutUntil: null };
-    auditLogger.log({
-      level: "CRITICAL",
-      event: "ACCOUNT_LOCKED_PERMANENT",
-      userId,
-      details: { reason: "Max failures reached", attempts, ip: clientIp },
+
+    Logger.warn("AUTH_FAILURE_RECORDED", { 
+      userId, 
+      attempts: newAttempts, 
+      isBanned: !!isRedisBanned 
+    });
+
+  } catch (error) {
+    // Fail-Safe: Log the error but don't crash the auth flow
+    Logger.error("RECORD_FAILED_ATTEMPT_CRITICAL_FAIL", { 
+      userId, 
+      error: error.message 
     });
   }
-
-  if (Object.keys(updateOperation).length > 0) {
-    await User.findByIdAndUpdate(userId, { $set: updateOperation });
-  }
-
-  metricsClient.security("login.attempt.fail", { userId, ip: clientIp });
 };
 
+/**
+ * @desc RESETS security state upon successful MFA verification
+ */
 const resetAttempts = async (userId) => {
   await User.findByIdAndUpdate(userId, {
-    $set: { failedLoginAttempts: 0, isLocked: false, lockoutUntil: null },
+    $set: { 
+      failedLoginAttempts: 0, 
+      isLocked: false, 
+      lockoutUntil: null 
+    },
   });
+  
   metricsClient.gauge("user.failed_attempts", 0, { userId });
-};
-
+  Logger.info("AUTH_STATE_RESET", { userId });
+}
 /**
  * @desc Core login logic with advanced security, auditing, and microservice decoupling.
  */
@@ -282,116 +308,65 @@ const generateLoginTokens = async ({
 const processUserLogin = async (identifier, password, context) => {
   const { ip: clientIp, userAgent, deviceName, session } = context;
 
-  const existingUser = await User.findOne({
-    $or: [
-      { username: identifier },
-      { phone: identifier },
-      { email: identifier },
-    ],
-  }).select(
-    "+password +failedLoginAttempts +isLocked +lockoutUntil +lastLoginLocation +mfaEnabled +passwordLastUpdated +isVerified +lastPasswordCheck +role",
-  );
+  // 1. ROBUST FETCH (From your existing code)
+  const user = await User.findOne({
+    $or: [{ username: identifier }, { phone: identifier }, { email: identifier }],
+  }).select("+password +failedLoginAttempts +isLocked +lockoutUntil +lastLoginLocation +mfaEnabled +passwordLastUpdated +isVerified +role");
 
-  if (!existingUser)
-    throw new AuthenticationError("Invalid credentials provided.");
+  if (!user) throw new AuthenticationError("Invalid credentials provided.");
 
-  const userId = existingUser._id.toString();
-
-  if (existingUser.isLocked) {
-    const now = new Date();
-    if (existingUser.lockoutUntil && existingUser.lockoutUntil > now) {
-      const remainingTime = Math.ceil(
-        (existingUser.lockoutUntil - now) / 60000,
-      );
-      throw new AuthenticationError(
-        `Account locked. Try again in ${remainingTime} minutes.`,
-      );
-    } else if (existingUser.lockoutUntil === null) {
-      throw new AuthenticationError(
-        "Account permanently locked. Contact support.",
-      );
-    }
+  // 2. SAFETY GUARDS (Your existing account locking logic)
+  if (user.isLocked) {
+     const now = new Date();
+     if (user.lockoutUntil && user.lockoutUntil > now) {
+        const remaining = Math.ceil((user.lockoutUntil - now) / 60000);
+        throw new AuthenticationError(`Account locked. Try again in ${remaining} minutes.`);
+     }
   }
 
-  if (!existingUser.isVerified)
-    return { user: { userID: userId }, accountUnverified: true };
+  if (!user.isVerified) return { user: { userID: user._id }, accountUnverified: true };
 
-  if (
-    typeof getPasswordExpiryStatus === "function" &&
-    getPasswordExpiryStatus(existingUser.passwordLastUpdated)
-  ) {
-    return { user: { userID: userId }, passwordExpired: true };
-  }
-
-  const isMatchPassword = await existingUser.comparePassword(password);
-  if (!isMatchPassword) {
-    await recordFailedAttempt(userId, clientIp);
+  // 3. CREDENTIAL VERIFICATION
+  const isMatch = await user.comparePassword(password);
+  if (!isMatch) {
+    await recordFailedAttempt(user._id, clientIp);
     throw new AuthenticationError("Invalid credentials provided.");
   }
 
-  const riskResult = await geoIpService.evaluateLoginRisk({
-    userId,
-    ip: clientIp,
-    userAgent,
-    lastKnownLocation: existingUser.lastLoginLocation,
-    thresholds: { impossibleTravelKm: 500 },
-  });
-
-  if (riskResult.action === "block")
-    throw new AuthenticationError("Access denied.");
-  const isSuspicious = riskResult.action === "challenge";
-
-  await resetAttempts(userId);
-  const updateLogin = {
-    lastLoginAt: new Date(),
-    lastLoginIp: clientIp,
-    lastPasswordCheck: existingUser.lastPasswordCheck || new Date(),
+  // 4. ADAPTIVE CONTEXT BUILDING
+  // We move the "Risk Evaluation" inside the initiateMfa call 
+  // to keep this controller clean.
+  const userContext = {
+    userId: user._id,
+    email: user.email,
+    isPrivileged: ["admin", "superadmin", "security"].includes(user.role),
+    riskScore: user.riskScore || 0,
+    lastLoginGeo: user.lastLoginLocation, 
+    lastLoginAt: user.lastLoginAt,
+    mfaEnabled: user.mfaEnabled 
   };
 
-  if (riskResult.geo) {
-    updateLogin.lastLoginLocation = {
-      latitude: riskResult.geo.latitude,
-      longitude: riskResult.geo.longitude,
-      city: riskResult.geo.city,
-      country: riskResult.geo.country,
-    };
-  }
-  await User.findByIdAndUpdate(userId, updateLogin);
+  const reqContext = { ip: clientIp, userAgent, session, traceId: uuidv4() };
 
-  if (existingUser.mfaEnabled || isSuspicious) {
-    const mfaResult = await mfaService.initiateMfa(
-      {
-        userId,
-        email: existingUser.email,
-        isPrivileged: ["admin", "superadmin", "security"].includes(
-          existingUser.role,
-        ),
-        riskScore: riskResult.score,
-        isNewDevice: isSuspicious,
-      },
-      { session, ip: clientIp },
-    );
+  // 5. TRIGGER ADAPTIVE ENGINE
+  // This handles: Impossible Travel, Zenith vs Absolute hashing, and challenge dispatch
+  const mfaResult = await mfaService.initiateMfa(userContext, reqContext);
 
-    return {
-      user: {
-        userID: userId,
-        role: existingUser.role,
-        username: existingUser.username,
-        isSuspicious,
-      },
-      ...mfaResult,
-    };
-  }
-
-  return await generateLoginTokens({
-    userId,
-    existingUser,
-    deviceName,
-    userAgent,
-    clientIp,
-    lastPasswordCheck: updateLogin.lastPasswordCheck,
-    isSuspicious: false,
+  // 6. DB UPDATES & RESPONSE
+  await resetAttempts(user._id);
+  await User.findByIdAndUpdate(user._id, { 
+    lastLoginAt: new Date(), 
+    lastLoginIp: clientIp 
   });
+
+  return {
+    user: { 
+      userID: user._id, 
+      role: user.role, 
+      username: user.username 
+    },
+    ...mfaResult
+  };
 };
 
 /* ===========================

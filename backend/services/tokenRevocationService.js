@@ -4,8 +4,8 @@
  * Logic: Atomic LUA Sharding, Deterministic TTLs, and SHA-Optimized Purge.
  */
 
-const { cacheConnection: redis } = require("../lib/redisCacheClient");
-const { scriptHashes } = require("../lib/redisInitialization"); // ⭐ SHA-Optimized Script Hashes
+const { cacheConnection: redis } = require("../event/lib/redisCacheClient");
+const { scriptHashes } = require("../event/lib/redisInitialization"); // ⭐ SHA-Optimized Script Hashes
 const Logger = require("../utils/logger");
 const Tracing = require("../utils/tracingClient");
 const Metrics = require("../utils/metricsClient");

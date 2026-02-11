@@ -1,7 +1,7 @@
 // utils/healthMonitorFactory.js (TRANSCENDENT APEX: Lifecycle-Aware Singleton)
 
 const os = require('os');
-const { version: appVersion } = require('../../package.json');
+const { version: appVersion } = require('../package.json');
 
 /**
  * @typedef {'OK' | 'DEGRADED' | 'UNAVAILABLE' | 'SHUTTING_DOWN' | 'INITIALIZING' | 'WARMING_UP'} HealthStatus

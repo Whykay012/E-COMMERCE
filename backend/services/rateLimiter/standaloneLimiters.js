@@ -1,5 +1,5 @@
-const redis = require("../../libs/redisClient");
-const { TooManyRequestsError } = require("../../errors/tooManyREquestError");
+const redis = require("../../lib/redisClient");
+const { TooManyRequestsError } = require("../../errors/tooManyRequestError");
 
 const resendRateLimiter = {
   /**
